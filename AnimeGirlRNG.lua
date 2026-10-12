@@ -1,5 +1,5 @@
 --[[
-    Anime Girl RNG - Robin Bounty Helper (Delta compatible) - FIXED click system
+    Anime Girl RNG - Robin Bounty Helper (Delta compatible) - FIXED click system + FIXED config macro save/load
 
     Every run, in this priority order:
       1. Talk to Robin -> View Bounties -> press every available "Accept"
@@ -8,12 +8,14 @@
       4. Claim completed quests
       5. FISHING quest active? -> teleport to your marked fishing spot (and stay there)
 
-    FIXES in this version:
-      * Finds the REAL clickable button behind the text ("VIEW BOUNTIES" / "ACCEPT")
-      * 6 click methods (signals, select+Enter, mouse, touch, fake input) - after every click it
-        VERIFIES the bounty window opened and switches method if not. Remembers what worked.
-      * Scrolls Accept buttons into view before pressing them
-      * pressButton no longer errors on labels
+    CONFIG FIXES in this version:
+      * Macro steps are no longer silently thrown away when an object can't be found at load time.
+        They are kept and resolved again when the macro is played (objects may load in late).
+      * Instance paths now handle several objects with the same name (stores the sibling index).
+      * More value types are saved (EnumItem, UDim, UDim2, BrickColor) and bigger/deeper tables.
+      * Writes are verified by reading the file back; falls back to memory if the executor can't write.
+      * Saving while still recording now stops the recording first (so the macro is complete).
+      * Save/load tell you exactly how many steps couldn't be saved or are pending.
 ]]
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -786,7 +788,15 @@ table.insert(conns, PPS.PromptTriggered:Connect(function(prompt, plr)
     if macroRecording and plr == lp then pushStep({ kind = "prompt", prompt = prompt }) end
 end))
 
+-- forward declaration: steps loaded from a config keep their raw data (s.enc) until the objects they point to exist.
+-- resolveStep(s, wait) is defined further down (it needs the path/decode helpers).
+local resolveStep
+
 local function runStep(s)
+    if s.enc then
+        -- not resolved yet (object wasn't loaded when the config was loaded): try again now, wait a few seconds
+        if not (resolveStep and resolveStep(s, 3)) then return end
+    end
     if s.kind == "remote" then
         if not (s.remote and s.remote.Parent) then return end
         if s.method == "FireServer" then
@@ -801,7 +811,7 @@ local function runStep(s)
             fireObj(s.prompt)
         end
     elseif s.kind == "gui" then
-        local o = (s.obj and s.obj:IsDescendantOf(pg)) and s.obj or refind(s.info)
+        local o = (s.obj and s.obj:IsDescendantOf(pg)) and s.obj or (s.info and refind(s.info))
         if o then pressTarget(o) end
     end
 end
@@ -931,25 +941,40 @@ env.AGRNG_Mem = MEM
 local hasFS = (writefile ~= nil) and (readfile ~= nil) and (isfile ~= nil)
 
 local function fileOf(key) return CONFIG.FilePrefix .. key .. ".json" end
+
+-- returns true if the data really is on disk. If the executor can't write (or the write didn't stick),
+-- the data is kept in memory for this session instead and false is returned.
 local function sWrite(key, str)
-    if hasFS then pcall(writefile, fileOf(key), str) else MEM[key] = str end
+    if hasFS then
+        local ok = pcall(writefile, fileOf(key), str)
+        if ok then
+            local rok, back = pcall(readfile, fileOf(key))
+            if rok and back == str then
+                MEM[key] = nil
+                return true
+            end
+        end
+    end
+    MEM[key] = str
+    return false
 end
+
 local function sRead(key)
+    if MEM[key] then return MEM[key] end -- only set when the disk write failed / no file access
     if hasFS then
         local ok, r = pcall(function()
             if isfile(fileOf(key)) then return readfile(fileOf(key)) end
             return nil
         end)
         if ok and r and r ~= "" then return r end
-        return nil
     end
-    return MEM[key]
+    return nil
 end
+
 local function sDelete(key)
+    MEM[key] = nil
     if hasFS then
         if delfile then pcall(delfile, fileOf(key)) else pcall(writefile, fileOf(key), "") end
-    else
-        MEM[key] = nil
     end
 end
 
@@ -975,24 +1000,65 @@ local function setAutoload(name)
 end
 
 -- ---------- config (de)serialization ----------
+-- A path is a list of segments. A segment is the object's name, or {name, n} when several siblings share that
+-- name (n = which one). Old saves that only contain plain names still load.
 local function pathOf(inst)
     local t, cur = {}, inst
     while cur and cur ~= game do
-        table.insert(t, 1, cur.Name)
-        cur = cur.Parent
+        local parent = cur.Parent
+        local seg = cur.Name
+        if parent then
+            local count, idx = 0, 0
+            for _, c in ipairs(parent:GetChildren()) do
+                if c.Name == cur.Name then
+                    count = count + 1
+                    if c == cur then idx = count end
+                end
+            end
+            if count > 1 then seg = { cur.Name, idx } end
+        end
+        table.insert(t, 1, seg)
+        cur = parent
     end
     if cur ~= game then return nil end
     return t
 end
 
-local function resolvePath(path)
+local function findChildSeg(parent, seg)
+    if type(seg) == "table" then
+        local count = 0
+        for _, c in ipairs(parent:GetChildren()) do
+            if c.Name == seg[1] then
+                count = count + 1
+                if count == seg[2] then return c end
+            end
+        end
+        -- the exact sibling index may differ between servers: fall back to the first one with that name
+        return parent:FindFirstChild(seg[1])
+    end
+    return parent:FindFirstChild(seg)
+end
+
+-- wait (seconds, optional) lets objects that haven't replicated/spawned yet show up
+local function resolvePath(path, wait)
+    if type(path) ~= "table" then return nil end
     local cur = game
-    for _, name in ipairs(path or {}) do
-        cur = cur and cur:FindFirstChild(name)
-        if not cur then return nil end
+    for _, seg in ipairs(path) do
+        local o = findChildSeg(cur, seg)
+        if not o and wait and wait > 0 then
+            local t0 = os.clock()
+            while not o and os.clock() - t0 < wait do
+                task.wait(0.2)
+                o = findChildSeg(cur, seg)
+            end
+        end
+        if not o then return nil end
+        cur = o
     end
     return cur
 end
+
+local MAX_DEPTH, MAX_ENTRIES = 8, 500
 
 local function encodeValue(v, depth)
     local t = typeof(v)
@@ -1012,11 +1078,15 @@ local function encodeValue(v, depth)
     if t == "Vector2" then return { t = "v2", x = v.X, y = v.Y } end
     if t == "Color3" then return { t = "c3", r = v.R, g = v.G, b = v.B } end
     if t == "CFrame" then return { t = "cf", c = { v:GetComponents() } } end
-    if t == "table" and depth < 4 then
+    if t == "UDim2" then return { t = "u2", a = v.X.Scale, b = v.X.Offset, c = v.Y.Scale, d = v.Y.Offset } end
+    if t == "UDim" then return { t = "u1", s = v.Scale, o = v.Offset } end
+    if t == "BrickColor" then return { t = "bc", n = v.Name } end
+    if t == "EnumItem" then return { t = "en", et = tostring(v.EnumType), n = v.Name } end
+    if t == "table" and depth < MAX_DEPTH then
         local entries, n = {}, 0
         for k, val in pairs(v) do
             n = n + 1
-            if n > 60 then return nil end
+            if n > MAX_ENTRIES then return nil end
             local ek, ev = encodeValue(k, depth + 1), encodeValue(val, depth + 1)
             if not ek or not ev then return nil end
             entries[#entries + 1] = { k = ek, v = ev }
@@ -1026,24 +1096,34 @@ local function encodeValue(v, depth)
     return nil
 end
 
-local function decodeValue(e)
+local function decodeValue(e, wait)
     if type(e) ~= "table" then return nil, false end
     local t = e.t
     if t == "z" then return nil, true end
     if t == "b" or t == "n" or t == "s" then return e.v, true end
     if t == "i" then
-        local o = resolvePath(e.p)
+        local o = resolvePath(e.p, wait)
         return o, o ~= nil
     end
     if t == "v3" then return Vector3.new(e.x, e.y, e.z), true end
     if t == "v2" then return Vector2.new(e.x, e.y), true end
     if t == "c3" then return Color3.new(e.r, e.g, e.b), true end
     if t == "cf" then return CFrame.new(table.unpack(e.c)), true end
+    if t == "u2" then return UDim2.new(e.a, e.b, e.c, e.d), true end
+    if t == "u1" then return UDim.new(e.s, e.o), true end
+    if t == "bc" then
+        local ok, r = pcall(BrickColor.new, e.n)
+        return r, ok
+    end
+    if t == "en" then
+        local ok, r = pcall(function() return Enum[e.et][e.n] end)
+        return r, ok and r ~= nil
+    end
     if t == "t" then
         local out = {}
         for _, ent in ipairs(e.e) do
-            local k, okk = decodeValue(ent.k)
-            local v, okv = decodeValue(ent.v)
+            local k, okk = decodeValue(ent.k, wait)
+            local v, okv = decodeValue(ent.v, wait)
             if not (okk and okv) or k == nil then return nil, false end
             out[k] = v
         end
@@ -1052,66 +1132,85 @@ local function decodeValue(e)
     return nil, false
 end
 
+-- encodes the macro. returns list, skippedCount
 local function encodeMacro()
     local out, skipped = {}, 0
     for _, s in ipairs(macro) do
-        local e = { kind = s.kind, dt = s.dt }
-        local ok = true
-        if s.kind == "remote" then
-            local p = s.remote and pathOf(s.remote)
-            if not p then
-                ok = false
-            else
-                e.path, e.method, e.n, e.args = p, s.method, s.args.n, {}
-                for i = 1, s.args.n do
-                    local ev = encodeValue(s.args[i], 0)
-                    if not ev then ok = false break end
-                    e.args[i] = ev
-                end
-            end
-        elseif s.kind == "prompt" then
-            local p = s.prompt and pathOf(s.prompt)
-            if p then e.path = p else ok = false end
-        elseif s.kind == "gui" then
-            e.info = s.info
+        if s.enc then
+            -- loaded from a config but not resolved yet: keep the original data so nothing is lost on re-save
+            out[#out + 1] = s.enc
         else
-            ok = false
+            local e = { kind = s.kind, dt = s.dt }
+            local ok = true
+            if s.kind == "remote" then
+                local p = s.remote and pathOf(s.remote)
+                if not p then
+                    ok = false
+                else
+                    e.path, e.method, e.n, e.args = p, s.method, s.args.n, {}
+                    for i = 1, s.args.n do
+                        local ev = encodeValue(s.args[i], 0)
+                        if not ev then ok = false break end
+                        e.args[i] = ev
+                    end
+                end
+            elseif s.kind == "prompt" then
+                local p = s.prompt and pathOf(s.prompt)
+                if p then e.path = p else ok = false end
+            elseif s.kind == "gui" then
+                e.info = s.info
+            else
+                ok = false
+            end
+            if ok then out[#out + 1] = e else skipped = skipped + 1 end
         end
-        if ok then out[#out + 1] = e else skipped = skipped + 1 end
     end
     return out, skipped
 end
 
+-- turns a raw saved step into a live one. returns true when everything it points to exists
+resolveStep = function(s, wait)
+    local e = s.enc
+    if not e then return true end
+    if s.kind == "remote" then
+        local r = resolvePath(e.path, wait)
+        if not (r and type(e.args) == "table") then return false end
+        local args = { n = e.n or #e.args }
+        for i = 1, args.n do
+            local v, okv = decodeValue(e.args[i], wait)
+            if not okv then return false end
+            args[i] = v
+        end
+        s.remote, s.method, s.args = r, e.method, args
+    elseif s.kind == "prompt" then
+        local pr = resolvePath(e.path, wait)
+        if not pr then return false end
+        s.prompt = pr
+    elseif s.kind == "gui" then
+        s.info = e.info
+    end
+    s.enc = nil
+    return true
+end
+
+-- returns malformedCount, pendingCount (pending = kept, will resolve when played)
 local function decodeMacro(list)
     table.clear(macro)
-    local dropped = 0
+    local bad, pending = 0, 0
     for _, e in ipairs(list or {}) do
-        local s = { kind = e.kind, dt = e.dt or 0.3 }
-        local ok = true
-        if e.kind == "remote" then
-            local r = resolvePath(e.path)
-            if r and type(e.args) == "table" then
-                local args = { n = e.n or #e.args }
-                for i = 1, args.n do
-                    local v, okv = decodeValue(e.args[i])
-                    if not okv then ok = false break end
-                    args[i] = v
-                end
-                s.remote, s.method, s.args = r, e.method, args
-            else
-                ok = false
-            end
-        elseif e.kind == "prompt" then
-            local pr = resolvePath(e.path)
-            if pr then s.prompt = pr else ok = false end
-        elseif e.kind == "gui" then
-            if type(e.info) == "table" then s.info = e.info else ok = false end
+        local valid = type(e) == "table"
+            and ((e.kind == "remote" and type(e.path) == "table" and type(e.args) == "table")
+              or (e.kind == "prompt" and type(e.path) == "table")
+              or (e.kind == "gui" and type(e.info) == "table"))
+        if valid then
+            local s = { kind = e.kind, dt = tonumber(e.dt) or 0.3, enc = e }
+            if not resolveStep(s, 0) then pending = pending + 1 end
+            macro[#macro + 1] = s
         else
-            ok = false
+            bad = bad + 1
         end
-        if ok then macro[#macro + 1] = s else dropped = dropped + 1 end
     end
-    return dropped
+    return bad, pending
 end
 
 local function v3t(v) return v and { v.X, v.Y, v.Z } or nil end
@@ -1122,7 +1221,7 @@ local currentConfig = nil
 local function buildConfig()
     local m, skipped = encodeMacro()
     return {
-        v = 1,
+        v = 2,
         settings = {
             runs = arcadeRuns, robinAuto = robinAuto, claimAuto = claimAuto,
             antiAfk = antiAfk, autoReconnect = autoReconnect,
@@ -1146,19 +1245,23 @@ local function applyConfig(t)
     antiAfk = st.antiAfk ~= false
     autoReconnect = st.autoReconnect == true
     if autoReconnect then queueReload() end
-    local dropped = decodeMacro(t.macro)
+    local bad, pending = decodeMacro(t.macro)
     saveData()
     if updateUI then updateUI() end
-    return dropped
+    return bad, pending
 end
 
 local function saveConfig(name)
     name = cleanName(name)
     if name == "" then return false, "Type a config name first" end
+    if macroRecording then
+        macroRecording = false
+        notify("Recording stopped so the macro could be saved")
+    end
     local cfg, skipped = buildConfig()
     local ok, json = pcall(function() return HttpService:JSONEncode(cfg) end)
     if not ok then return false, "Couldn't encode the macro (unsupported data)" end
-    sWrite("cfg_" .. name, json)
+    local onDisk = sWrite("cfg_" .. name, json)
     local idx, found = loadIndex(), false
     for _, n in ipairs(idx) do if n == name then found = true end end
     if not found then
@@ -1166,7 +1269,11 @@ local function saveConfig(name)
         saveIndex(idx)
     end
     currentConfig = name
-    return true, (skipped > 0) and (skipped .. " macro step(s) couldn't be saved") or nil, name
+    local notes = {}
+    notes[#notes + 1] = ("%d macro step(s) saved"):format(#cfg.macro)
+    if skipped > 0 then notes[#notes + 1] = skipped .. " couldn't be saved (objects without a path / unsupported data)" end
+    if not onDisk then notes[#notes + 1] = "WARNING: couldn't write the file, kept in memory only" end
+    return true, table.concat(notes, ", "), name
 end
 
 local function loadConfig(name)
@@ -1174,9 +1281,12 @@ local function loadConfig(name)
     if not raw then return false, "Config not found" end
     local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok or type(t) ~= "table" then return false, "Config file is corrupt" end
-    local dropped = applyConfig(t)
+    local bad, pending = applyConfig(t)
     currentConfig = name
-    return true, (dropped > 0) and (dropped .. " macro step(s) couldn't be restored (objects not found)") or nil
+    local notes = { ("%d macro step(s)"):format(#macro) }
+    if pending > 0 then notes[#notes + 1] = pending .. " will be resolved when the macro plays (objects not loaded yet)" end
+    if bad > 0 then notes[#notes + 1] = bad .. " invalid step(s) skipped" end
+    return true, table.concat(notes, ", ")
 end
 
 local function deleteConfig(name)
@@ -1484,6 +1594,7 @@ makeButton("Create / Save", 206, row(32), 84, BLUE, function()
         selectedCfg = saved
         nameBox.Text = ""
         notify("Saved config: " .. saved .. (msg and (" (" .. msg .. ")") or ""))
+        lastDetect = "Config '" .. saved .. "': " .. (msg or "saved")
     else
         notify(msg or "Save failed")
     end
@@ -1530,6 +1641,7 @@ makeButton("Load", 10, y, 137, BLUE, function()
     if not selectedCfg then notify("Select a config in the list first") return end
     local ok, msg = loadConfig(selectedCfg)
     notify(ok and ("Loaded: " .. selectedCfg .. (msg and (" (" .. msg .. ")") or "")) or (msg or "Load failed"))
+    if ok then lastDetect = "Config '" .. selectedCfg .. "': " .. (msg or "loaded") end
     refreshConfigList()
 end)
 local delArmed = 0
@@ -1556,6 +1668,7 @@ makeButton("Overwrite Selected (use current settings)", 10, row(32), 280, ORANGE
         local ok, msg, saved = saveConfig(selectedCfg)
         if ok then
             notify("Overwrote config: " .. saved .. (msg and (" (" .. msg .. ")") or ""))
+            lastDetect = "Config '" .. saved .. "': " .. (msg or "saved")
         else
             notify(msg or "Overwrite failed")
         end
@@ -1613,10 +1726,15 @@ content.CanvasSize = UDim2.fromOffset(0, cy + 10)
 
 updateUI = function()
     local counts = { remote = 0, prompt = 0, gui = 0 }
-    for _, s in ipairs(macro) do counts[s.kind] = (counts[s.kind] or 0) + 1 end
+    local pendingN = 0
+    for _, s in ipairs(macro) do
+        counts[s.kind] = (counts[s.kind] or 0) + 1
+        if s.enc then pendingN = pendingN + 1 end
+    end
     recBtn.Text = macroRecording and "Stop Recording" or "Record Arcade Macro"
     recBtn.BackgroundColor3 = macroRecording and RED or ORANGE
-    macroLbl.Text = ("Macro: %d steps (%d remote, %d prompt, %d tap)"):format(#macro, counts.remote, counts.prompt, counts.gui)
+    macroLbl.Text = ("Macro: %d steps (%d remote, %d prompt, %d tap)%s"):format(#macro, counts.remote, counts.prompt, counts.gui,
+        pendingN > 0 and (" [" .. pendingN .. " pending]") or "")
     runsLbl.Text = "Arcade runs: " .. arcadeRuns
     fishLbl.Text = "Fishing spot: " .. fmtVec(fishSpot)
     iconLbl.Text = "Quest icon: " .. (questIconInfo and questIconInfo.name or "not set")
