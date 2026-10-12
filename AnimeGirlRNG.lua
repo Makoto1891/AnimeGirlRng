@@ -1549,6 +1549,27 @@ makeButton("Mark Robin Spot (optional)", 10, row(32), 280, nil, function()
     if r then robinSpot = r.Position saveData() updateUI() notify("Robin spot marked") end
 end)
 
+makeButton("Teleport to Robin", 10, row(32), 280, BLUE, function()
+    task.spawn(function()
+        local r = findRobin()
+        if not r and robinSpot then
+            -- Robin may be streamed out: go to the marked spot first so she loads in
+            teleportTo(robinSpot, Vector3.new(0, 3, 0))
+            for _ = 1, 8 do
+                task.wait(0.5)
+                r = findRobin()
+                if r then break end
+            end
+        end
+        if r then
+            teleportTo(r.pos)
+            notify("Teleported to Robin")
+        else
+            notify("Robin not found - stand near her and use 'Mark Robin Spot' first")
+        end
+    end)
+end)
+
 local afkBtn = makeButton("", 10, row(32), 280, GREEN_ON, function()
     antiAfk = not antiAfk
     updateUI()
