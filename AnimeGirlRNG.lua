@@ -1,26 +1,19 @@
 --[[
-    Anime Girl RNG - Robin Bounty Helper (Delta compatible)
+    Anime Girl RNG - Robin Bounty Helper (Delta compatible) - FIXED click system
 
-    ONE PANEL, focused on Robin's Summer Bounties.
     Every run, in this priority order:
       1. Talk to Robin -> View Bounties -> press every available "Accept"
       2. Read your active quests (quest icon on the left)
       3. ARCADE quest active?  -> replay your recorded arcade macro (N times)
       4. Claim completed quests
       5. FISHING quest active? -> teleport to your marked fishing spot (and stay there)
-    Extras: 30-min auto-run (toggle button, red = OFF / green = ON), auto-claim loop, minimize ("-") into a draggable icon.
 
-    FIRST-TIME SETUP
-      a) "Pick Quest Icon" -> tap the quest/banner icon on the left side of the screen.
-      b) "Mark Fishing Spot" while standing where you want to fish.
-      c) "Record Arcade Macro" -> play ONE arcade mini game by hand -> press Stop.
-         (Don't tap Roll/Auto Roll while recording.)
-      d) Optional: "Mark Robin Spot" (fallback if Robin isn't loaded in).
-      e) "Run Robin Now" to test, then turn on Auto Run / Auto Claim.
-
-    CONFIGS: type a name -> Create/Save (stores macro + spots + quest icon + every toggle).
-      Load / Delete (tap twice) from the list. "Autoload" = loaded automatically every time
-      the script runs. Anti-AFK and Auto Reconnect (rejoins + reloads the script) are toggles.
+    FIXES in this version:
+      * Finds the REAL clickable button behind the text ("VIEW BOUNTIES" / "ACCEPT")
+      * 6 click methods (signals, select+Enter, mouse, touch, fake input) - after every click it
+        VERIFIES the bounty window opened and switches method if not. Remembers what worked.
+      * Scrolls Accept buttons into view before pressing them
+      * pressButton no longer errors on labels
 ]]
 
 if not game:IsLoaded() then game.Loaded:Wait() end
@@ -43,17 +36,17 @@ local CONFIG = {
         WindowKeywords = { "resets in", "summer bount" }, -- text that proves the bounty window is open
         AcceptKeywords = { "accept" },
         AcceptExclude = { "accepted" },
-        IntervalSeconds = 1800,        -- 30 minutes between cycles
-        AutoStart = false,             -- true = timer starts by itself on load; false = you toggle it
-        FirstRunDelay = 30,            -- seconds after loading before the first cycle
+        IntervalSeconds = 1800,
+        AutoStart = false,
+        FirstRunDelay = 30,
         DialogWait = 1.0,
     },
     ClaimKeywords = { "claim", "collect" },
     ClaimExclude = { "claimed" },
-    ClaimInterval = 20,                -- seconds between auto-claim sweeps
+    ClaimInterval = 20,
     FishKeywords = { "fish", "angler" },
     ArcadeKeywords = { "mini game", "minigame", "mini-game", "arcade" },
-    QuestIconNames = { "quest", "bounty", "mission" }, -- only used if you didn't pick the icon
+    QuestIconNames = { "quest", "bounty", "mission" },
     Arcade = {
         IgnoreRemotes = { "roll", "ping", "heartbeat", "camera", "position", "walk", "sprint" },
         BetweenRuns = 1.5,
@@ -61,10 +54,10 @@ local CONFIG = {
         MaxSteps = 400,
     },
     TeleportOffset = Vector3.new(0, 3, 4),
-    ReturnAfterRun = true,             -- go back after a run (not when a fishing quest sends you to the spot)
-    VirtualClickFallback = true,       -- tap on screen if no button signal could be fired
+    ReturnAfterRun = true,
+    VirtualClickFallback = true,
     SaveFile = "AGRNG_Robin.json",
-    FilePrefix = "AGRNG_Robin_",       -- config files: AGRNG_Robin_cfg_<name>.json
+    FilePrefix = "AGRNG_Robin_",
     ScriptUrl = "https://raw.githubusercontent.com/Makoto1891/AnimeGirlRng/refs/heads/main/AnimeGirlRNG.lua",
 }
 
@@ -87,6 +80,8 @@ local macro, macroRecording, lastStepT = {}, false, 0
 local lastDetect = "Quests: not checked yet"
 local conns = {}
 local updateUI
+local MAXM = 6          -- number of click methods
+local prefMethod = 1    -- click method that worked last time
 
 -- ---------- helpers ----------
 local function lower(s) return string.lower(tostring(s or "")) end
@@ -172,43 +167,188 @@ local function refind(info)
     return best
 end
 
-local function pressButton(b)
-    local fired = 0
-    if getconnections then
-        for _, sig in ipairs({ b.MouseButton1Click, b.Activated }) do
+local function centerOf(o) return o.AbsolutePosition + o.AbsoluteSize / 2 end
+
+local function rectHas(g, p)
+    local a, s = g.AbsolutePosition, g.AbsoluteSize
+    return p.X >= a.X and p.X <= a.X + s.X and p.Y >= a.Y and p.Y <= a.Y + s.Y
+end
+
+-- find the object that actually receives the click for a piece of text
+local function resolveClickable(o)
+    if o:IsA("GuiButton") then return o end
+    local a = o:FindFirstAncestorWhichIsA("GuiButton")
+    if a then return a end
+    -- a separate (often transparent) button laid over the label: smallest visible button containing the label center
+    local c = centerOf(o)
+    local best, bestArea
+    local cur, n = o.Parent, 0
+    while cur and cur ~= pg and n < 3 do
+        for _, d in ipairs(cur:GetDescendants()) do
+            if d:IsA("GuiButton") and rectHas(d, c) and isShown(d) then
+                local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+                if not bestArea or area < bestArea then best, bestArea = d, area end
+            end
+        end
+        if best then return best end
+        cur = cur.Parent
+        n = n + 1
+    end
+    return o
+end
+
+-- scroll any parent ScrollingFrame so the object is visible
+local function scrollIntoView(o)
+    local cur = o.Parent
+    while cur and cur ~= pg do
+        if cur:IsA("ScrollingFrame") then
             pcall(function()
-                for _, c in ipairs(getconnections(sig)) do c:Fire() fired = fired + 1 end
+                local top = o.AbsolutePosition.Y
+                local bot = top + o.AbsoluteSize.Y
+                local sTop = cur.AbsolutePosition.Y
+                local sBot = sTop + cur.AbsoluteSize.Y
+                if top < sTop or bot > sBot then
+                    local rel = top - sTop + cur.CanvasPosition.Y
+                    local target = rel - (cur.AbsoluteSize.Y - o.AbsoluteSize.Y) / 2
+                    cur.CanvasPosition = Vector2.new(cur.CanvasPosition.X, math.max(0, target))
+                    task.wait(0.2)
+                end
             end)
         end
-    elseif firesignal then
-        if pcall(firesignal, b.MouseButton1Click) then fired = fired + 1 end
-        pcall(firesignal, b.Activated)
+        cur = cur.Parent
     end
-    if fired == 0 and CONFIG.VirtualClickFallback and VIM then
+end
+
+-- ---------- click methods ----------
+-- method 1: fire the button's signals
+local function fireSignals(b)
+    local fired = 0
+    if not b:IsA("GuiButton") then return 0 end
+    for _, name in ipairs({ "MouseButton1Down", "MouseButton1Click", "MouseButton1Up", "Activated" }) do
         pcall(function()
-            local pos = b.AbsolutePosition + b.AbsoluteSize / 2 + GuiService:GetGuiInset()
-            VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-            fired = 1
+            local sig = b[name]
+            if getconnections then
+                for _, c in ipairs(getconnections(sig)) do
+                    pcall(function() c:Fire() end)
+                    fired = fired + 1
+                end
+            elseif firesignal then
+                firesignal(sig)
+                fired = fired + 1
+            end
         end)
     end
     return fired
 end
 
-local function pressTarget(o)
-    if o:IsA("GuiButton") then return pressButton(o) end
-    if VIM then
-        pcall(function()
-            local pos = o.AbsolutePosition + o.AbsoluteSize / 2 + GuiService:GetGuiInset()
-            VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-        end)
+local function vimTap(o, withInset)
+    if not VIM then return 0 end
+    pcall(function()
+        local pos = centerOf(o)
+        if withInset then pos = pos + GuiService:GetGuiInset() end
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        task.wait(0.07)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+    return 1
+end
+
+local function touchTap(o, withInset)
+    if not VIM then return 0 end
+    pcall(function()
+        local pos = centerOf(o)
+        if withInset then pos = pos + GuiService:GetGuiInset() end
+        VIM:SendTouchEvent(7, 0, pos.X, pos.Y)
+        task.wait(0.08)
+        VIM:SendTouchEvent(7, 2, pos.X, pos.Y)
+    end)
+    return 1
+end
+
+-- select the button with the GUI selector, then press Enter (very reliable on mobile executors)
+local function selectEnter(b)
+    if not (VIM and b:IsA("GuiObject")) then return 0 end
+    pcall(function()
+        local old = b.Selectable
+        b.Selectable = true
+        GuiService.SelectedObject = b
+        task.wait(0.15)
+        VIM:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+        task.wait(0.06)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        task.wait(0.1)
+        GuiService.SelectedObject = nil
+        b.Selectable = old
+    end)
+    return 1
+end
+
+local function fakeInput(o)
+    if not getconnections then return 0 end
+    local c = centerOf(o)
+    local function mk(state)
+        return {
+            UserInputType = Enum.UserInputType.MouseButton1,
+            UserInputState = state,
+            KeyCode = Enum.KeyCode.Unknown,
+            Position = Vector3.new(c.X, c.Y, 0),
+            Delta = Vector3.new(0, 0, 0),
+        }
+    end
+    local cur, n = o, 0
+    while cur and cur ~= pg and n < 3 do
+        if cur:IsA("GuiObject") then
+            pcall(function()
+                for _, cn in ipairs(getconnections(cur.InputBegan)) do cn:Fire(mk(Enum.UserInputState.Begin), false) end
+                for _, cn in ipairs(getconnections(cur.InputEnded)) do cn:Fire(mk(Enum.UserInputState.End), false) end
+            end)
+            if cur:IsA("GuiButton") then
+                pcall(function()
+                    for _, cn in ipairs(getconnections(cur.MouseButton1Click)) do cn:Fire() end
+                    for _, cn in ipairs(getconnections(cur.Activated)) do cn:Fire() end
+                end)
+            end
+        end
+        cur = cur.Parent
+        n = n + 1
     end
     return 1
 end
 
+-- 1 signals | 2 select+Enter | 3 mouse(inset) | 4 mouse(no inset) | 5 touch | 6 fake input events
+local function tapMethod(obj, m)
+    local b = resolveClickable(obj)
+    if m == 1 then
+        if b:IsA("GuiButton") then
+            local n = fireSignals(b)
+            if n == 0 then return vimTap(b, true) end
+            return n
+        end
+        return vimTap(b, true)
+    elseif m == 2 then
+        return selectEnter(b)
+    elseif m == 3 then
+        return vimTap(b, true)
+    elseif m == 4 then
+        return vimTap(b, false)
+    elseif m == 5 then
+        return touchTap(b, true)
+    end
+    return fakeInput(b)
+end
+
+-- simple press (never errors, works on labels too)
+local function pressButton(b)
+    return tapMethod(b, 1)
+end
+
+local function pressTarget(o)
+    if o:IsA("GuiButton") then return pressButton(o) end
+    vimTap(o, true)
+    return 1
+end
+
+-- ---------- finding buttons ----------
 -- visible buttons whose own text / inner label text matches. scopeSet (optional) limits to given labels.
 local function findButtons(keywords, exact, exclude, scopeSet)
     local out, seen = {}, {}
@@ -226,7 +366,7 @@ local function findButtons(keywords, exact, exclude, scopeSet)
                     end
                 end
                 if hit and isShown(d) then
-                    local btn = d:IsA("TextButton") and d or d:FindFirstAncestorWhichIsA("GuiButton") or d
+                    local btn = resolveClickable(d)
                     if btn and not seen[btn] and isShown(btn) then
                         seen[btn] = true
                         out[#out + 1] = btn
@@ -241,7 +381,7 @@ end
 local function pressByText(keywords, exact, exclude, scopeSet)
     local btns = findButtons(keywords, exact, exclude, scopeSet)
     for _, b in ipairs(btns) do
-        pressButton(b)
+        tapMethod(b, prefMethod)
         task.wait(0.2)
     end
     return #btns
@@ -263,7 +403,6 @@ local function diffSince(before)
     return out, n
 end
 
--- are fishing / arcade quest texts visible (optionally only inside scopeSet)?
 local function detect(scopeSet)
     local fish, arcade = false, false
     for _, d in ipairs(pg:GetDescendants()) do
@@ -301,80 +440,30 @@ local function topInteractiveAt(pos)
     return nil
 end
 
--- ---------- tap methods (tried in order until something responds) ----------
-local function vimTap(o, withInset)
-    if not VIM then return 0 end
-    pcall(function()
-        local pos = o.AbsolutePosition + o.AbsoluteSize / 2
-        if withInset then pos = pos + GuiService:GetGuiInset() end
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-        task.wait(0.06)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-    end)
-    return 1
-end
-
-local function fakeInput(o)
-    if not getconnections then return 0 end
-    local c = o.AbsolutePosition + o.AbsoluteSize / 2
-    local function mk(state)
-        return {
-            UserInputType = Enum.UserInputType.MouseButton1,
-            UserInputState = state,
-            KeyCode = Enum.KeyCode.Unknown,
-            Position = Vector3.new(c.X, c.Y, 0),
-            Delta = Vector3.new(0, 0, 0),
-        }
-    end
-    local cur, n = o, 0
-    while cur and cur ~= pg and n < 3 do
-        if cur:IsA("GuiObject") then
-            pcall(function()
-                for _, cn in ipairs(getconnections(cur.InputBegan)) do cn:Fire(mk(Enum.UserInputState.Begin), false) end
-                for _, cn in ipairs(getconnections(cur.InputEnded)) do cn:Fire(mk(Enum.UserInputState.End), false) end
-            end)
-            if cur:IsA("GuiButton") then
-                pcall(function()
-                    for _, cn in ipairs(getconnections(cur.MouseButton1Click)) do cn:Fire() end
-                    for _, cn in ipairs(getconnections(cur.Activated)) do cn:Fire() end
-                end)
-            end
-        end
-        cur = cur.Parent
-        n = n + 1
-    end
-    return 1
-end
-
--- method 1: button signals | 2: real tap (with top-bar inset) | 3: real tap (no inset) | 4: fake input events
-local function tapMethod(b, m)
-    if m == 1 then
-        if b:IsA("GuiButton") then return pressButton(b) end
-        return vimTap(b, true)
-    elseif m == 2 then
-        return vimTap(b, true)
-    elseif m == 3 then
-        return vimTap(b, false)
-    end
-    return fakeInput(b)
-end
-
--- press every match; if the number of matches doesn't go down, switch to the next tap method
+-- press every match; if the count doesn't go down, escalate to the next click method.
+-- returns how many buttons actually disappeared (= accepted)
 local function pressAll(keywords, exact, exclude, scopeSet, maxRounds)
-    local method, total = 1, 0
+    local method = prefMethod
+    local first
     for _ = 1, maxRounds do
         local targets = findButtons(keywords, exact, exclude, scopeSet)
+        if first == nil then first = #targets end
         if #targets == 0 then break end
         for _, b in ipairs(targets) do
+            scrollIntoView(b)
             tapMethod(b, method)
-            task.wait(0.25)
+            task.wait(0.4)
         end
-        total = total + #targets
-        task.wait(0.7)
+        task.wait(0.8)
         local after = findButtons(keywords, exact, exclude, scopeSet)
-        if #after >= #targets then method = math.min(method + 1, 4) end
+        if #after >= #targets then
+            method = (method % MAXM) + 1
+        else
+            prefMethod = method
+        end
     end
-    return total
+    local remaining = #findButtons(keywords, exact, exclude, scopeSet)
+    return math.max(0, (first or 0) - remaining)
 end
 
 local function bountyWindowOpen()
@@ -391,17 +480,22 @@ local function bountyWindowOpen()
     return false
 end
 
--- click "View Bounties" and verify the bounty window really opened
+-- click "View Bounties", verify the bounty window really opened, cycle click methods until it does
 local function openBounties()
-    local method = 1
-    for _ = 1, 6 do
-        if bountyWindowOpen() then return true end
-        local targets = findButtons(CONFIG.Robin.OpenKeywords)
-        if #targets == 0 then return false end
-        for _, b in ipairs(targets) do tapMethod(b, method) end
-        task.wait(1.0)
-        if bountyWindowOpen() then return true end
-        method = math.min(method + 1, 4)
+    for _ = 1, 2 do
+        for i = 0, MAXM - 1 do
+            if bountyWindowOpen() then return true end
+            local targets = findButtons(CONFIG.Robin.OpenKeywords)
+            if #targets == 0 then return bountyWindowOpen() end
+            local m = ((prefMethod - 1 + i) % MAXM) + 1
+            tapMethod(targets[1], m)
+            task.wait(1.1)
+            if bountyWindowOpen() then
+                prefMethod = m
+                notify(("View Bounties opened (method %d)"):format(m))
+                return true
+            end
+        end
     end
     return bountyWindowOpen()
 end
@@ -450,13 +544,11 @@ local function getQuestIcon()
     return nil
 end
 
--- open quest panel, claim finished quests, detect active fishing/arcade quests, close panel
--- returns ok, claimedCount, fishActive, arcadeActive
 local function claimSweep()
     local icon = getQuestIcon()
     if not icon then return false, 0, false, false end
     local before = textSet()
-    pressButton(icon)
+    tapMethod(icon, 1)
     task.wait(0.9)
     local fresh, n = diffSince(before)
     local opened = n > 2
@@ -465,7 +557,7 @@ local function claimSweep()
     local fresh2 = opened and (diffSince(before)) or nil
     local fish, arcade = detect(fresh2)
     if opened then
-        pressButton(icon)
+        tapMethod(icon, 1)
         task.wait(0.4)
     end
     lastDetect = ("Quests: fishing %s | arcade %s"):format(fish and "YES" or "no", arcade and "YES" or "no")
@@ -532,7 +624,6 @@ local function findRobin()
     return best
 end
 
--- returns found, opened(1/0), accepted, fallbackFish, fallbackArcade
 local function robinTalk()
     local r = findRobin()
     if not r and robinSpot then
@@ -544,7 +635,7 @@ local function robinTalk()
     teleportTo(r.pos)
     task.wait(0.6)
 
-    -- 1) get Robin's dialog on screen (retry the prompt a few times)
+    -- 1) get Robin's dialog on screen
     local dialogShown = false
     for _ = 1, 3 do
         if bountyWindowOpen() or #findButtons(CONFIG.Robin.OpenKeywords) > 0 then dialogShown = true break end
@@ -562,7 +653,7 @@ local function robinTalk()
         return true, 0, 0, false, false
     end
 
-    -- 2) press View Bounties, verified
+    -- 2) press View Bounties (verified, cycles click methods)
     task.wait(CONFIG.Robin.DialogWait)
     if not openBounties() then
         notify("Couldn't open View Bounties. Open Robin's dialog by hand and press Copy UI Debug.")
@@ -573,8 +664,9 @@ local function robinTalk()
     -- 3) accept everything available
     task.wait(CONFIG.Robin.DialogWait)
     local accepted = pressAll(CONFIG.Robin.AcceptKeywords, false, CONFIG.Robin.AcceptExclude, nil, 6)
-    local fbFish, fbArcade = detect(nil) -- fallback detection while the bounty window is open
+    local fbFish, fbArcade = detect(nil)
     pressByText({ "x" }, true)
+    task.wait(0.3)
     pressByText({ "bye" }, true)
     return true, 1, accepted, fbFish, fbArcade
 end
@@ -596,7 +688,6 @@ local function addRemoteStep(remote, method, args)
     pushStep({ kind = "remote", remote = remote, method = method, args = args })
 end
 
--- one shared __namecall hook (survives re-execution without stacking)
 if not env.AGRNG_HookInstalled then
     pcall(function()
         if hookmetamethod and getnamecallmethod then
@@ -682,7 +773,6 @@ local function robinRun()
         end
 
         local steps = 0
-        -- PRIORITY 1: arcade macro
         if arcade then
             if #macro > 0 then
                 steps = playMacro(arcadeRuns)
@@ -694,7 +784,6 @@ local function robinRun()
             end
         end
 
-        -- PRIORITY 2: fishing spot
         if fish then
             if fishSpot then
                 teleportTo(fishSpot, Vector3.new(0, 3, 0))
@@ -768,7 +857,7 @@ pcall(function()
     end))
 end)
 
--- ---------- config storage (files if available, memory otherwise) ----------
+-- ---------- config storage ----------
 local MEM = env.AGRNG_Mem or {}
 env.AGRNG_Mem = MEM
 local hasFS = (writefile ~= nil) and (readfile ~= nil) and (isfile ~= nil)
@@ -1088,7 +1177,6 @@ local function makeDraggable(handle, target, scaleInst, onTap)
     end))
 end
 
--- title bar
 local titleBar = Instance.new("Frame")
 titleBar.Size = UDim2.fromOffset(300, 30)
 titleBar.BackgroundTransparency = 1
@@ -1106,7 +1194,6 @@ title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = titleBar
 makeDraggable(titleBar, main, ui, nil)
 
--- minimized icon
 local icon = Instance.new("TextButton")
 icon.Size = UDim2.fromOffset(46, 46)
 icon.Position = main.Position
@@ -1166,7 +1253,6 @@ makeButton("-", 236, 3, 26, Color3.fromRGB(80, 80, 110), function()
 end)
 makeButton("X", 266, 3, 26, Color3.fromRGB(170, 60, 60), function() env.AGRNG_Stop() end)
 
--- scrolling content
 local content = Instance.new("ScrollingFrame")
 content.Size = UDim2.fromOffset(300, PANEL_H - 34)
 content.Position = UDim2.fromOffset(0, 34)
@@ -1189,7 +1275,7 @@ end
 local statusLbl = makeLabel("Ready", 10, row(52), 280, 48, true)
 
 makeButton("Run Robin Now", 10, row(32), 280, BLUE, function()
-    if robinAuto then nextRobinRun = os.time() + CONFIG.Robin.IntervalSeconds end -- restart the 30 min timer
+    if robinAuto then nextRobinRun = os.time() + CONFIG.Robin.IntervalSeconds end
     task.spawn(robinRun)
 end)
 
@@ -1441,7 +1527,6 @@ updateUI = function()
     autoloadBtn.BackgroundColor3 = al and Color3.fromRGB(40, 120, 60) or Color3.fromRGB(60, 60, 80)
 end
 
--- taps: quest-icon picking + macro recording
 local function inRect(g, pos)
     if not g.Visible then return false end
     local p, s = g.AbsolutePosition, g.AbsoluteSize
@@ -1469,7 +1554,6 @@ end))
 
 refreshConfigList()
 
--- autoload the chosen config when the script runs
 do
     local al = getAutoload()
     if al and sRead("cfg_" .. al) then
@@ -1481,7 +1565,6 @@ do
 end
 updateUI()
 
--- timers: anti-AFK nudge, reconnect watch, auto run, auto claim, status text
 task.spawn(function()
     local lastNudge = os.time()
     while alive do
