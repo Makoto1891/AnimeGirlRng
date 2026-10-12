@@ -80,7 +80,7 @@ local macro, macroRecording, lastStepT = {}, false, 0
 local lastDetect = "Quests: not checked yet"
 local conns = {}
 local updateUI
-local MAXM = 6          -- number of click methods
+local MAXM = 9          -- number of click methods
 local prefMethod = 1    -- click method that worked last time
 
 -- ---------- helpers ----------
@@ -335,7 +335,37 @@ local function fakeInput(o)
     return 1
 end
 
--- 1 signals | 2 select+Enter | 3 mouse(inset) | 4 mouse(no inset) | 5 touch | 6 fake input events
+local function fireNative(b)
+    if not (firesignal and b:IsA("GuiButton")) then return 0 end
+    local n = 0
+    local fakeIn = { UserInputType = Enum.UserInputType.MouseButton1, UserInputState = Enum.UserInputState.End, KeyCode = Enum.KeyCode.Unknown }
+    for _, name in ipairs({ "MouseButton1Down", "MouseButton1Click", "MouseButton1Up" }) do
+        if pcall(firesignal, b[name]) then n = n + 1 end
+    end
+    if pcall(firesignal, b.Activated, fakeIn, 1) then n = n + 1 end
+    return n
+end
+
+-- select the button, then press gamepad A (activates the selected button)
+local function selectPad(b)
+    if not (VIM and b:IsA("GuiObject")) then return 0 end
+    pcall(function()
+        local old = b.Selectable
+        b.Selectable = true
+        GuiService.SelectedObject = b
+        task.wait(0.2)
+        VIM:SendKeyEvent(true, Enum.KeyCode.ButtonA, false, game)
+        task.wait(0.08)
+        VIM:SendKeyEvent(false, Enum.KeyCode.ButtonA, false, game)
+        task.wait(0.1)
+        GuiService.SelectedObject = nil
+        b.Selectable = old
+    end)
+    return 1
+end
+
+-- 1 signals | 2 select+Enter | 3 mouse(inset) | 4 mouse(no inset) | 5 touch(inset) | 6 fake input events
+-- 7 firesignal | 8 select+gamepad A | 9 touch(no inset)
 local function tapMethod(obj, m)
     local b = resolveClickable(obj)
     if m == 1 then
@@ -353,8 +383,14 @@ local function tapMethod(obj, m)
         return vimTap(b, false)
     elseif m == 5 then
         return touchTap(b, true)
+    elseif m == 6 then
+        return fakeInput(b)
+    elseif m == 7 then
+        return fireNative(b)
+    elseif m == 8 then
+        return selectPad(b)
     end
-    return fakeInput(b)
+    return touchTap(b, false)
 end
 
 -- simple press (never errors, works on labels too)
@@ -500,6 +536,25 @@ local function bountyWindowOpen()
     return false
 end
 
+-- last resort: if the bounty window already exists but is hidden, show it ourselves
+local function forceOpenBountyWindow()
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local t = cleanText(d.Text)
+            if #t < 60 and string.find(t, "summer bount", 1, true) then
+                local cur = d
+                while cur and cur ~= pg do
+                    if cur:IsA("GuiObject") then cur.Visible = true end
+                    if cur:IsA("ScreenGui") then cur.Enabled = true end
+                    cur = cur.Parent
+                end
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- click "View Bounties", verify the bounty window really opened, cycle click methods until it does
 -- maxM limits which methods may be used (1-2 never touch the screen)
 local function openBounties(maxM)
@@ -517,6 +572,13 @@ local function openBounties(maxM)
                 notify(("View Bounties opened (method %d)"):format(m))
                 return true
             end
+        end
+    end
+    if forceOpenBountyWindow() then
+        task.wait(0.8)
+        if bountyWindowOpen() then
+            notify("Button click failed - forced the bounty window open")
+            return true
         end
     end
     return bountyWindowOpen()
@@ -542,6 +604,63 @@ local function dumpUI()
         print(out)
         notify(("UI dump printed to console (%d lines)"):format(#lines))
     end
+end
+
+local function emit(out, label)
+    if setclipboard then
+        pcall(setclipboard, out)
+        notify(label .. " copied to clipboard")
+    else
+        print(out)
+        notify(label .. " printed to console")
+    end
+end
+
+-- explains why a click on "View Bounties" does nothing (open Robin's dialog first)
+local function clickDebug()
+    local targets = findButtons(CONFIG.Robin.OpenKeywords)
+    if #targets == 0 then notify("Open Robin's dialog first (View Bounties must be visible)") return end
+    local b = targets[1]
+    local lines = {}
+    local function add(x) lines[#lines + 1] = x end
+    add("TARGET: " .. b.ClassName .. " " .. b:GetFullName())
+    pcall(function()
+        add(("Active=%s Interactable=%s Selectable=%s ZIndex=%d Size=%s Pos=%s"):format(
+            tostring(b.Active), tostring(b.Interactable), tostring(b.Selectable), b.ZIndex, tostring(b.AbsoluteSize), tostring(b.AbsolutePosition)))
+    end)
+    pcall(function()
+        local sg = b:FindFirstAncestorOfClass("ScreenGui")
+        add(("ScreenGui=%s DisplayOrder=%d IgnoreGuiInset=%s"):format(sg.Name, sg.DisplayOrder, tostring(sg.IgnoreGuiInset)))
+    end)
+    local gi = (debug and debug.getinfo) or getinfo
+    for _, name in ipairs({ "MouseButton1Click", "Activated", "MouseButton1Down", "MouseButton1Up", "InputBegan", "InputEnded", "TouchTap" }) do
+        pcall(function()
+            local cons = getconnections and getconnections(b[name]) or {}
+            add(("%s: %d connection(s)"):format(name, #cons))
+            for _, cn in ipairs(cons) do
+                local info = ""
+                local f = cn.Function
+                if f and gi then
+                    pcall(function()
+                        local i = gi(f)
+                        info = tostring(i.short_src) .. ":" .. tostring(i.currentline or i.linedefined) .. " " .. tostring(i.name)
+                    end)
+                end
+                add("   fn " .. info .. " enabled=" .. tostring(cn.Enabled))
+            end
+        end)
+    end
+    for _, off in ipairs({ Vector2.new(0, 0), (GuiService:GetGuiInset()) }) do
+        pcall(function()
+            local c = b.AbsolutePosition + b.AbsoluteSize / 2 + off
+            add("OBJECTS AT " .. tostring(c) .. " (top first):")
+            for i, h in ipairs(pg:GetGuiObjectsAtPosition(c.X, c.Y)) do
+                if i > 8 then break end
+                add("   " .. h.ClassName .. " " .. h:GetFullName())
+            end
+        end)
+    end
+    emit(table.concat(lines, "\n"), "Click debug")
 end
 
 -- ---------- quest icon ----------
@@ -825,7 +944,32 @@ local function pushStep(step)
     if updateUI then updateUI() end
 end
 
+local spyOn, spyLog = false, {}
+local function ser(v, d)
+    d = d or 0
+    local t = typeof(v)
+    if t == "string" then return string.format("%q", v) end
+    if t == "Instance" then return "Instance(" .. v:GetFullName() .. ")" end
+    if t == "table" then
+        if d > 2 then return "{...}" end
+        local parts, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if n > 12 then parts[#parts + 1] = "..." break end
+            parts[#parts + 1] = "[" .. ser(k, d + 1) .. "]=" .. ser(val, d + 1)
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+    return tostring(v)
+end
+
 local function addRemoteStep(remote, method, args)
+    if spyOn and #spyLog < 150 and not matches(remote.Name, { "ping", "heartbeat", "camera", "position", "walk", "sprint", "roll" }) then
+        local parts = {}
+        for i = 1, args.n do parts[i] = ser(args[i]) end
+        local line = ("%s %s(%s)"):format(remote:GetFullName(), method, table.concat(parts, ", "))
+        if spyLog[#spyLog] ~= line then spyLog[#spyLog + 1] = line end
+    end
     if not macroRecording then return end
     if matches(remote.Name, CONFIG.Arcade.IgnoreRemotes) then return end
     pushStep({ kind = "remote", remote = remote, method = method, args = args })
@@ -1657,6 +1801,23 @@ autoloadBtn = makeButton("", 10, row(32), 280, nil, function()
     updateUI()
 end)
 
+makeButton("Copy Click Debug (Robin dialog open)", 10, row(32), 280, nil, function()
+    task.spawn(clickDebug)
+end)
+local spyBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
+    spyOn = not spyOn
+    if spyOn then
+        table.clear(spyLog)
+        notify(hookOk and "Remote Spy ON: now do Talk > View Bounties > Accept BY HAND" or "Remote Spy ON but the executor has no remote hook")
+    else
+        notify(("Remote Spy OFF (%d calls logged)"):format(#spyLog))
+    end
+    updateUI()
+end)
+makeButton("Copy Remote Log", 10, row(32), 280, nil, function()
+    if #spyLog == 0 then notify("Log is empty") return end
+    emit(table.concat(spyLog, "\n"), "Remote log")
+end)
 makeButton("Copy UI Debug (visible buttons/text)", 10, row(32), 280, nil, function()
     task.spawn(dumpUI)
 end)
@@ -1684,6 +1845,7 @@ updateUI = function()
     setToggle(claimBtn, "Auto Claim Completed Quests", claimAuto)
     setToggle(afkBtn, "Anti-AFK", antiAfk)
     setToggle(reconBtn, "Auto Reconnect (+reload script)", autoReconnect)
+    setToggle(spyBtn, "Remote Spy", spyOn)
     local al = getAutoload()
     autoloadBtn.Text = "Autoload: " .. (al or "OFF") .. (selectedCfg and (al ~= selectedCfg) and "  (tap = use selected)" or (al and "  (tap = clear)" or ""))
     autoloadBtn.BackgroundColor3 = al and Color3.fromRGB(40, 120, 60) or Color3.fromRGB(60, 60, 80)
