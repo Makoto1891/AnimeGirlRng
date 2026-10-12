@@ -1480,6 +1480,25 @@ makeButton("Delete", 153, y, 137, RED, function()
     end
 end)
 
+local ovwArmed = 0
+makeButton("Overwrite Selected (use current settings)", 10, row(32), 280, ORANGE, function()
+    if not selectedCfg then notify("Select a config in the list first") return end
+    if os.clock() - ovwArmed < 3 then
+        ovwArmed = 0
+        local ok, msg, saved = saveConfig(selectedCfg)
+        if ok then
+            notify("Overwrote config: " .. saved .. (msg and (" (" .. msg .. ")") or ""))
+        else
+            notify(msg or "Overwrite failed")
+        end
+        refreshConfigList()
+        updateUI()
+    else
+        ovwArmed = os.clock()
+        notify("Tap again within 3s to overwrite '" .. selectedCfg .. "'")
+    end
+end)
+
 autoloadBtn = makeButton("", 10, row(32), 280, nil, function()
     local al = getAutoload()
     if selectedCfg and al ~= selectedCfg then
