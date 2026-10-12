@@ -40,6 +40,12 @@ local CONFIG = {
         AutoStart = false,
         FirstRunDelay = 30,
         DialogWait = 1.0,
+        UseRemotes = true,             -- accept bounties by calling the game's remotes directly (no UI clicks)
+        KnownBountyIds = {             -- used only if the bounty board can't be read
+            "robin_biome_1", "robin_biome_4", "robin_fish_1", "robin_fish_10", "robin_fish_25", "robin_fish_50",
+            "robin_mini_1", "robin_mini_5", "robin_mini_10", "robin_mini_20",
+            "robin_roll_100m", "robin_roll_10k", "robin_roll_100k",
+        },
     },
     ClaimKeywords = { "claim", "collect" },
     ClaimExclude = { "claimed" },
@@ -765,6 +771,130 @@ local function findRobin()
     return best
 end
 
+-- ---- direct remote method (found with Remote Spy): board = RobinQuest:GetBountyBoard, accept = RobinQuest:Accept ----
+local function getRemote(name)
+    local rs = game:GetService("ReplicatedStorage")
+    local folder = rs:FindFirstChild("Remotes")
+    local r = folder and folder:FindFirstChild(name)
+    if r then return r end
+    for _, d in ipairs(rs:GetDescendants()) do
+        if d.Name == name and (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then return d end
+    end
+    return nil
+end
+
+local function invokeTimeout(rf, timeout)
+    local done, ok, res = false, false, nil
+    task.spawn(function()
+        ok, res = pcall(function() return rf:InvokeServer() end)
+        done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < timeout do task.wait(0.1) end
+    if not done then return false, nil end
+    return ok, res
+end
+
+local function sigOf(v, d)
+    d = d or 0
+    if type(v) ~= "table" then return tostring(v) end
+    if d > 5 then return "{..}" end
+    local keys = {}
+    for k in pairs(v) do keys[#keys + 1] = k end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = tostring(k) .. "=" .. sigOf(v[k], d + 1) end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local BLOCKED_STATUS = { active = true, accepted = true, inprogress = true, ["in_progress"] = true, ["in progress"] = true,
+    completed = true, complete = true, claimed = true, done = true, finished = true }
+
+local function entryBlocked(t)
+    if type(t) ~= "table" then return false end
+    for k, v in pairs(t) do
+        local key = lower(k)
+        if type(v) == "boolean" and v and (key == "accepted" or key == "active" or key == "claimed"
+            or key == "completed" or key == "complete" or key == "done") then
+            return true
+        end
+        if type(v) == "string" and (key == "status" or key == "state") and BLOCKED_STATUS[lower(v)] then
+            return true
+        end
+    end
+    return false
+end
+
+-- collect bounty ids ("robin_...") from whatever structure the board has
+local function collectBounties(node, out, seen, depth, ignoreBlocked)
+    if depth > 6 or type(node) ~= "table" then return end
+    local idKeys = { id = true, Id = true, ID = true, questId = true, QuestId = true, bountyId = true, BountyId = true }
+    for k, v in pairs(node) do
+        if type(k) == "string" and string.sub(k, 1, 6) == "robin_" then
+            if not seen[k] and (ignoreBlocked or not entryBlocked(v)) then seen[k] = true out[#out + 1] = k end
+        end
+        if type(v) == "string" and string.sub(v, 1, 6) == "robin_" and (type(k) == "number" or idKeys[k]) then
+            if not seen[v] and (ignoreBlocked or not entryBlocked(node)) then seen[v] = true out[#out + 1] = v end
+        elseif type(v) == "table" then
+            collectBounties(v, out, seen, depth + 1, ignoreBlocked)
+        end
+    end
+end
+
+-- returns ok, acceptedCount. ok=false means "use the dialog instead"
+local function acceptViaRemotes()
+    if not CONFIG.Robin.UseRemotes then return false, 0 end
+    local interact = getRemote("Quest:NPCInteracted")
+    local board = getRemote("RobinQuest:GetBountyBoard")
+    local accept = getRemote("RobinQuest:Accept")
+    if not (board and accept and board:IsA("RemoteFunction") and accept:IsA("RemoteEvent")) then
+        notify("Bounty remotes not found - using the dialog instead")
+        return false, 0
+    end
+    if interact and interact:IsA("RemoteEvent") then
+        pcall(function() interact:FireServer() end)
+        task.wait(0.4)
+    end
+    local ok1, b1 = invokeTimeout(board, 6)
+    if not ok1 then
+        notify("Couldn't read the bounty board - using the dialog instead")
+        return false, 0
+    end
+    local all, avail = {}, {}
+    collectBounties(b1, all, {}, 0, true)
+    collectBounties(b1, avail, {}, 0, false)
+    local understood = #all > 0
+    local ids = understood and avail or CONFIG.Robin.KnownBountyIds
+    for _, id in ipairs(ids) do
+        pcall(function() accept:FireServer(id) end)
+        task.wait(0.35)
+    end
+    task.wait(0.6)
+    local accepted = 0
+    local ok2, b2 = invokeTimeout(board, 6)
+    if ok2 then
+        if understood then
+            local rem = {}
+            collectBounties(b2, rem, {}, 0, false)
+            accepted = math.max(0, #avail - #rem)
+        else
+            accepted = (sigOf(b1) ~= sigOf(b2)) and #ids or 0
+        end
+    end
+    notify(("Bounties: sent %d accept(s), %d accepted"):format(#ids, accepted))
+    if understood and #avail > 0 and accepted == 0 then return false, 0 end -- server ignored them: try the dialog
+    return true, accepted
+end
+
+local function dumpBoard()
+    local board = getRemote("RobinQuest:GetBountyBoard")
+    if not (board and board:IsA("RemoteFunction")) then notify("Board remote not found") return end
+    local ok, res = invokeTimeout(board, 6)
+    if not ok then notify("Couldn't read the board") return end
+    local out = sigOf(res)
+    emit(out, "Bounty board")
+end
+
 local hiddenPromptBtns = {}
 local function hidePromptGui(on)
     pcall(function()
@@ -874,6 +1004,10 @@ local function robinTalk()
     if not r then return false, 0, 0, false, false end
     teleportTo(r.pos)
     task.wait(0.6)
+
+    -- fast path: talk to the game's server directly, no dialog / clicks needed
+    local rOk, rAccepted = acceptViaRemotes()
+    if rOk then return true, 1, rAccepted, false, false end
 
     local prompt = r.inst
     local function setPrompt(on)
@@ -1801,6 +1935,9 @@ autoloadBtn = makeButton("", 10, row(32), 280, nil, function()
     updateUI()
 end)
 
+makeButton("Copy Bounty Board (debug)", 10, row(32), 280, nil, function()
+    task.spawn(dumpBoard)
+end)
 makeButton("Copy Click Debug (Robin dialog open)", 10, row(32), 280, nil, function()
     task.spawn(clickDebug)
 end)
