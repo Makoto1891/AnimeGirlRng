@@ -45,8 +45,7 @@ local CONFIG = {
     },
     ClaimKeywords = { "claim", "collect" },
     ClaimExclude = { "claimed" },
-    ClaimInterval = 20,
-    FollowUpClaimDelay = 300,          -- seconds after the end of a run to re-check the quest page and claim
+    ClaimInterval = 300,               -- Auto Claim toggle: check for claimable quests every 5 minutes
     FishKeywords = { "fish", "angler" },
     ArcadeKeywords = { "mini game", "minigame", "mini-game", "arcade" },
     QuestIconNames = { "quest", "bounty", "mission" },
@@ -90,7 +89,6 @@ local function sleep(t)
     local t0 = os.clock()
     while os.clock() - t0 < t and not abortFlag and alive do task.wait(0.1) end
 end
-local followUpAt = 0     -- when to re-check the quest page after a run (0 = nothing scheduled)
 
 -- ---------- helpers ----------
 local function lower(s) return string.lower(tostring(s or "")) end
@@ -461,6 +459,84 @@ local function panelSig(root)
     return table.concat(t, "|")
 end
 
+-- ---- only press Claim buttons that are really ready ----
+local SUFFIX = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
+local function parseNum(n, suf)
+    n = string.gsub(n, ",", "")
+    local v = tonumber(n)
+    if not v then return nil end
+    return v * (SUFFIX[suf] or 1)
+end
+
+-- "3/10", "1,200 / 5k", "50m/100m" -> current, max (nil if the text has no progress)
+local function progressOf(t)
+    if #t > 40 then return nil end
+    local a, sa, b, sb = string.match(t, "([%d%.,]+)%s*([kmbt]?)%s*/%s*([%d%.,]+)%s*([kmbt]?)")
+    if not a then return nil end
+    local cur, max = parseNum(a, sa), parseNum(b, sb)
+    if cur and max and max > 0 then return cur, max end
+    return nil
+end
+
+-- the label must really BE a claim button text (not a quest description like "Collect 10 coins")
+local function isClaimLabel(t)
+    if #t > 20 then return false end
+    return isClaimText(t) or t == "collect" or t == "collect!" or t == "collect reward"
+end
+
+local function looksDisabled(btn, label)
+    if btn:IsA("GuiButton") then
+        if btn.Active == false then return true end
+        local ok, inter = pcall(function() return btn.Interactable end)
+        if ok and inter == false then return true end
+    end
+    if label and label.TextTransparency >= 0.4 then return true end -- greyed-out text
+    return false
+end
+
+-- progress (cur, max) of the quest row this button belongs to, or nil if it can't be told
+local function rowProgress(btn, root)
+    local cur, levels = btn.Parent, 0
+    local bestCur, bestMax
+    while cur and cur ~= root and cur ~= pg and levels < 5 do
+        local n, otherClaims, fc, fm = 0, 0, nil, nil
+        for _, d in ipairs(cur:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and isShown(d) then
+                local t = cleanText(d.Text)
+                if isClaimLabel(t) and resolveClickable(d) ~= btn then otherClaims = otherClaims + 1 end
+                local c, m = progressOf(t)
+                if c then n = n + 1 fc, fm = c, m end
+            end
+        end
+        -- stop growing once the container covers more than one quest row
+        if n > 1 or otherClaims > 0 then break end
+        if n == 1 then bestCur, bestMax = fc, fm end
+        cur = cur.Parent
+        levels = levels + 1
+    end
+    return bestCur, bestMax
+end
+
+local function findClaimButtons(root)
+    local out, seen = {}, {}
+    for d in pairs(panelScope(root)) do
+        local t = cleanText(d.Text)
+        if isClaimLabel(t) and reallyShown(d) then
+            local btn = resolveClickable(d)
+            if btn and btn:IsA("GuiButton") and not seen[btn] and isShown(btn) then
+                seen[btn] = true
+                local ready = not looksDisabled(btn, d)
+                if ready then
+                    local c, m = rowProgress(btn, root)
+                    if c and c < m then ready = false end -- e.g. 3/10: not finished yet
+                end
+                if ready then out[#out + 1] = btn end
+            end
+        end
+    end
+    return out
+end
+
 -- open the quest page, claim everything claimable, read which quests are active, close the page again
 -- returns ok, claimRounds, fishActive, arcadeActive
 local function claimSweep()
@@ -492,11 +568,12 @@ local function claimSweep()
     task.wait(0.6) -- let the quest list finish loading
 
     -- claim: press Claim, and keep going for as long as pressing it changes the page
-    local claimed = 0
+    local claimed, pressedTotal = 0, 0
     local lastSig = panelSig(root)
     for _ = 1, 5 do
-        local btns = findButtons(CONFIG.ClaimKeywords, false, CONFIG.ClaimExclude, panelScope(root))
+        local btns = findClaimButtons(root)
         if #btns == 0 then break end
+        pressedTotal = pressedTotal + #btns
         for _, b in ipairs(btns) do
             pressButton(b)
             task.wait(0.3)
@@ -523,7 +600,7 @@ local function claimSweep()
         end
     end
 
-    lastDetect = ("Quests: fishing %s | arcade %s"):format(fish and "YES" or "no", arcade and "YES" or "no")
+    lastDetect = ("Quests: fishing %s | arcade %s | claimed %d"):format(fish and "YES" or "no", arcade and "YES" or "no", pressedTotal)
     return true, claimed, fish, arcade
 end
 
@@ -880,11 +957,8 @@ local function robinRun()
             end
         end
 
-        -- final task done: look at the quest page again later and claim whatever finished meanwhile
-        followUpAt = os.time() + CONFIG.FollowUpClaimDelay
-
-        notify(("Run done. Accepted %d | macro steps %d | %s | claim check in %d min"):format(
-            accepted or 0, steps, stayAtFishing and "at fishing spot" or "back home", CONFIG.FollowUpClaimDelay / 60))
+        notify(("Run done. Accepted %d | macro steps %d | %s"):format(
+            accepted or 0, steps, stayAtFishing and "at fishing spot" or "back home"))
     end)
     if not ok then notify("Run error: " .. tostring(err)) end
     if abortFlag then notify("Run stopped") end
@@ -1469,7 +1543,6 @@ local statusLbl = makeLabel("Ready", 10, row(52), 280, 48, true)
 makeButton("STOP (auto run + macro)", 10, row(32), 280, RED, function()
     abortFlag = true
     robinAuto, claimAuto = false, false
-    followUpAt = 0
     macroRecording = false
     notify("Stopped: auto run/claim OFF, running macro/run cancelled")
     updateUI()
@@ -1786,7 +1859,7 @@ updateUI = function()
     pickBtn.Text = pickMode and "Tap the icon now... (cancel)" or "Pick Quest Icon"
     pickBtn.BackgroundColor3 = pickMode and RED or Color3.fromRGB(60, 60, 80)
     setToggle(autoBtn, ("Auto Run every %d min"):format(CONFIG.Robin.IntervalSeconds / 60), robinAuto)
-    setToggle(claimBtn, "Auto Claim Completed Quests", claimAuto)
+    setToggle(claimBtn, ("Auto Claim Quests (every %d min)"):format(CONFIG.ClaimInterval / 60), claimAuto)
     setToggle(afkBtn, "Anti-AFK", antiAfk)
     setToggle(reconBtn, "Auto Reconnect (+reload script)", autoReconnect)
     setToggle(spyBtn, "Remote Spy", spyOn)
@@ -1851,14 +1924,6 @@ task.spawn(function()
         if robinAuto and not busy and not macroRecording and now >= nextRobinRun then
             nextRobinRun = now + CONFIG.Robin.IntervalSeconds
             task.spawn(robinRun)
-        elseif followUpAt > 0 and not busy and not macroRecording and not pickMode and now >= followUpAt then
-            followUpAt = 0
-            task.spawn(function()
-                busy = true
-                local okc, _, n = pcall(claimSweep)
-                busy = false
-                if okc then notify(("Follow-up quest check done (%s)"):format((n and n > 0) and "claimed" or "nothing to claim")) end
-            end)
         elseif claimAuto and not busy and not macroRecording and not pickMode and now >= nextClaim then
             nextClaim = now + CONFIG.ClaimInterval
             task.spawn(function()
@@ -1881,8 +1946,8 @@ task.spawn(function()
         else
             line1 = "Auto run is OFF"
         end
-        if followUpAt > 0 and not reconnecting and not macroRecording then
-            local lf = math.max(0, followUpAt - now)
+        if claimAuto and not reconnecting and not macroRecording then
+            local lf = math.max(0, nextClaim - now)
             line1 = line1 .. (" | claim in %02d:%02d"):format(math.floor(lf / 60), lf % 60)
         end
         statusLbl.Text = line1 .. "\n" .. lastDetect .. "\n"
