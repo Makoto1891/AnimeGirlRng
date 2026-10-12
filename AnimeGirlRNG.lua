@@ -55,7 +55,8 @@ local CONFIG = {
         DefaultRuns = 1,
         MaxSteps = 400,
     },
-    TeleportOffset = Vector3.new(0, 3, 4),
+    AntiAfkJumpInterval = 600,         -- seconds between anti-AFK jumps (10 minutes)
+    TeleportOffset =Vector3.new(0, 3, 4),
     ReturnAfterRun = true,
     VirtualClickFallback = true,
     SaveFile = "AGRNG_Robin.json",
@@ -72,7 +73,7 @@ local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
 local alive = true
 local busy = false
 local robinAuto, claimAuto = CONFIG.Robin.AutoStart, false
-local antiAfk, autoReconnect = true, false
+local autoReconnect = false
 local nextRobinRun, nextClaim = os.time() + CONFIG.Robin.FirstRunDelay, 0
 local fishSpot, robinSpot, arcadePos = nil, nil, nil
 local arcadeRuns = CONFIG.Arcade.DefaultRuns
@@ -966,18 +967,6 @@ local function robinRun()
     busy = false
 end
 
--- ---------- anti-AFK ----------
-local VU = nil
-pcall(function() VU = game:GetService("VirtualUser") end)
-table.insert(conns, lp.Idled:Connect(function()
-    if antiAfk and VU then
-        pcall(function()
-            VU:CaptureController()
-            VU:ClickButton2(Vector2.new())
-        end)
-    end
-end))
-
 -- ---------- auto reconnect ----------
 local reconnecting = false
 
@@ -1312,7 +1301,7 @@ local function buildConfig()
         v = 2,
         settings = {
             runs = arcadeRuns, robinAuto = robinAuto, claimAuto = claimAuto,
-            antiAfk = antiAfk, autoReconnect = autoReconnect,
+            autoReconnect = autoReconnect,
             fish = v3t(fishSpot), robin = v3t(robinSpot), arcade = v3t(arcadePos), icon = questIconInfo,
         },
         macro = m,
@@ -1330,7 +1319,6 @@ local function applyConfig(t)
     claimAuto = st.claimAuto == true
     if robinAuto then nextRobinRun = os.time() + CONFIG.Robin.FirstRunDelay end
     if claimAuto then nextClaim = os.time() + 10 end
-    antiAfk = st.antiAfk ~= false
     autoReconnect = st.autoReconnect == true
     if autoReconnect then queueReload() end
     local bad, pending = decodeMacro(t.macro)
@@ -1667,10 +1655,6 @@ makeButton("Teleport to Robin", 10, row(32), 280, BLUE, function()
     end)
 end)
 
-local afkBtn = makeButton("", 10, row(32), 280, GREEN_ON, function()
-    antiAfk = not antiAfk
-    updateUI()
-end)
 local reconBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
     autoReconnect = not autoReconnect
     if autoReconnect then
@@ -1860,7 +1844,6 @@ updateUI = function()
     pickBtn.BackgroundColor3 = pickMode and RED or Color3.fromRGB(60, 60, 80)
     setToggle(autoBtn, ("Auto Run every %d min"):format(CONFIG.Robin.IntervalSeconds / 60), robinAuto)
     setToggle(claimBtn, ("Auto Claim Quests (every %d min)"):format(CONFIG.ClaimInterval / 60), claimAuto)
-    setToggle(afkBtn, "Anti-AFK", antiAfk)
     setToggle(reconBtn, "Auto Reconnect (+reload script)", autoReconnect)
     setToggle(spyBtn, "Remote Spy", spyOn)
     local al = getAutoload()
@@ -1907,17 +1890,19 @@ end
 updateUI()
 
 task.spawn(function()
-    local lastNudge = os.time()
+    local lastJump = os.time()
     while alive do
         task.wait(1)
         local now = os.time()
 
-        if antiAfk and VU and now - lastNudge >= 50 then
-            lastNudge = now
-            pcall(function()
-                VU:CaptureController()
-                VU:ClickButton2(Vector2.new())
-            end)
+        -- anti-AFK: jump every 10 minutes so Roblox doesn't kick you for idling (no clicks involved)
+        if now - lastJump >= CONFIG.AntiAfkJumpInterval then
+            lastJump = now
+            local c = lp.Character
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            end
         end
         if autoReconnect and not reconnecting and disconnected() then rejoin() end
 
@@ -1951,7 +1936,7 @@ task.spawn(function()
             line1 = line1 .. (" | claim in %02d:%02d"):format(math.floor(lf / 60), lf % 60)
         end
         statusLbl.Text = line1 .. "\n" .. lastDetect .. "\n"
-            .. ("Config: %s | AFK %s | Reconnect %s"):format(currentConfig or "none", antiAfk and "ON" or "OFF", autoReconnect and "ON" or "OFF")
+            .. ("Config: %s | Reconnect %s"):format(currentConfig or "none", autoReconnect and "ON" or "OFF")
     end
 end)
 
