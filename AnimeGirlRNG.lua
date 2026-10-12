@@ -35,6 +35,7 @@ local CONFIG = {
     Robin = {
         NpcName = "robin",
         OpenKeywords = { "view bounties" },
+        WindowKeywords = { "resets in", "summer bount" }, -- text that proves the bounty window is open
         AcceptKeywords = { "accept" },
         AcceptExclude = { "accepted" },
         IntervalSeconds = 1800,        -- 30 minutes between cycles
@@ -217,7 +218,7 @@ local function findButtons(keywords, exact, exclude, scopeSet)
                     end
                 end
                 if hit and isShown(d) then
-                    local btn = d:IsA("TextButton") and d or d:FindFirstAncestorWhichIsA("GuiButton")
+                    local btn = d:IsA("TextButton") and d or d:FindFirstAncestorWhichIsA("GuiButton") or d
                     if btn and not seen[btn] and isShown(btn) then
                         seen[btn] = true
                         out[#out + 1] = btn
@@ -292,6 +293,133 @@ local function topInteractiveAt(pos)
     return nil
 end
 
+-- ---------- tap methods (tried in order until something responds) ----------
+local function vimTap(o, withInset)
+    if not VIM then return 0 end
+    pcall(function()
+        local pos = o.AbsolutePosition + o.AbsoluteSize / 2
+        if withInset then pos = pos + GuiService:GetGuiInset() end
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        task.wait(0.06)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    end)
+    return 1
+end
+
+local function fakeInput(o)
+    if not getconnections then return 0 end
+    local c = o.AbsolutePosition + o.AbsoluteSize / 2
+    local function mk(state)
+        return {
+            UserInputType = Enum.UserInputType.MouseButton1,
+            UserInputState = state,
+            KeyCode = Enum.KeyCode.Unknown,
+            Position = Vector3.new(c.X, c.Y, 0),
+            Delta = Vector3.new(0, 0, 0),
+        }
+    end
+    local cur, n = o, 0
+    while cur and cur ~= pg and n < 3 do
+        if cur:IsA("GuiObject") then
+            pcall(function()
+                for _, cn in ipairs(getconnections(cur.InputBegan)) do cn:Fire(mk(Enum.UserInputState.Begin), false) end
+                for _, cn in ipairs(getconnections(cur.InputEnded)) do cn:Fire(mk(Enum.UserInputState.End), false) end
+            end)
+            if cur:IsA("GuiButton") then
+                pcall(function()
+                    for _, cn in ipairs(getconnections(cur.MouseButton1Click)) do cn:Fire() end
+                    for _, cn in ipairs(getconnections(cur.Activated)) do cn:Fire() end
+                end)
+            end
+        end
+        cur = cur.Parent
+        n = n + 1
+    end
+    return 1
+end
+
+-- method 1: button signals | 2: real tap (with top-bar inset) | 3: real tap (no inset) | 4: fake input events
+local function tapMethod(b, m)
+    if m == 1 then
+        if b:IsA("GuiButton") then return pressButton(b) end
+        return vimTap(b, true)
+    elseif m == 2 then
+        return vimTap(b, true)
+    elseif m == 3 then
+        return vimTap(b, false)
+    end
+    return fakeInput(b)
+end
+
+-- press every match; if the number of matches doesn't go down, switch to the next tap method
+local function pressAll(keywords, exact, exclude, scopeSet, maxRounds)
+    local method, total = 1, 0
+    for _ = 1, maxRounds do
+        local targets = findButtons(keywords, exact, exclude, scopeSet)
+        if #targets == 0 then break end
+        for _, b in ipairs(targets) do
+            tapMethod(b, method)
+            task.wait(0.25)
+        end
+        total = total + #targets
+        task.wait(0.7)
+        local after = findButtons(keywords, exact, exclude, scopeSet)
+        if #after >= #targets then method = math.min(method + 1, 4) end
+    end
+    return total
+end
+
+local function bountyWindowOpen()
+    for _, d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and isShown(d) then
+            local t = cleanText(d.Text)
+            if #t < 60 then
+                for _, k in ipairs(CONFIG.Robin.WindowKeywords) do
+                    if string.find(t, k, 1, true) then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- click "View Bounties" and verify the bounty window really opened
+local function openBounties()
+    local method = 1
+    for _ = 1, 6 do
+        if bountyWindowOpen() then return true end
+        local targets = findButtons(CONFIG.Robin.OpenKeywords)
+        if #targets == 0 then return false end
+        for _, b in ipairs(targets) do tapMethod(b, method) end
+        task.wait(1.0)
+        if bountyWindowOpen() then return true end
+        method = math.min(method + 1, 4)
+    end
+    return bountyWindowOpen()
+end
+
+local function dumpUI()
+    local lines = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+        if isShown(d) then
+            if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Text ~= "" then
+                lines[#lines + 1] = ("%s | %q | %s"):format(d.ClassName, d.Text, d:GetFullName())
+            elseif d:IsA("ImageButton") then
+                lines[#lines + 1] = ("ImageButton | %s | %s"):format(d.Name, d:GetFullName())
+            end
+        end
+        if #lines >= 250 then break end
+    end
+    local out = table.concat(lines, "\n")
+    if setclipboard then
+        pcall(setclipboard, out)
+        notify(("UI dump copied to clipboard (%d lines)"):format(#lines))
+    else
+        print(out)
+        notify(("UI dump printed to console (%d lines)"):format(#lines))
+    end
+end
+
 -- ---------- quest icon ----------
 local function setQuestIcon(btn)
     questIcon = btn
@@ -353,8 +481,16 @@ end
 
 local function fireObj(inst)
     if inst:IsA("ProximityPrompt") then
-        pcall(function() inst.HoldDuration = 0 end)
-        if fireproximityprompt then pcall(fireproximityprompt, inst) end
+        pcall(function()
+            inst.HoldDuration = 0
+            inst.RequiresLineOfSight = false
+            inst.MaxActivationDistance = math.max(inst.MaxActivationDistance, 20)
+        end)
+        if fireproximityprompt then
+            pcall(fireproximityprompt, inst)
+        else
+            pcall(function() inst:InputHoldBegin() task.wait(0.1) inst:InputHoldEnd() end)
+        end
     elseif inst:IsA("ClickDetector") then
         if fireclickdetector then pcall(fireclickdetector, inst) end
     end
@@ -388,7 +524,7 @@ local function findRobin()
     return best
 end
 
--- returns found, opened, accepted, fallbackFish, fallbackArcade
+-- returns found, opened(1/0), accepted, fallbackFish, fallbackArcade
 local function robinTalk()
     local r = findRobin()
     if not r and robinSpot then
@@ -399,19 +535,40 @@ local function robinTalk()
     if not r then return false, 0, 0, false, false end
     teleportTo(r.pos)
     task.wait(0.6)
-    fireObj(r.inst)
-    task.wait(CONFIG.Robin.DialogWait)
-    local opened = pressByText(CONFIG.Robin.OpenKeywords)
-    task.wait(CONFIG.Robin.DialogWait)
-    local accepted = 0
-    for _ = 1, 2 do
-        accepted = accepted + pressByText(CONFIG.Robin.AcceptKeywords, false, CONFIG.Robin.AcceptExclude)
+
+    -- 1) get Robin's dialog on screen (retry the prompt a few times)
+    local dialogShown = false
+    for _ = 1, 3 do
+        if bountyWindowOpen() or #findButtons(CONFIG.Robin.OpenKeywords) > 0 then dialogShown = true break end
+        fireObj(r.inst)
+        for _ = 1, 12 do
+            task.wait(0.4)
+            if #findButtons(CONFIG.Robin.OpenKeywords) > 0 or bountyWindowOpen() then dialogShown = true break end
+        end
+        if dialogShown then break end
+        teleportTo(r.pos, Vector3.new(0, 3, 2))
         task.wait(0.5)
     end
+    if not dialogShown then
+        notify("Robin's dialog didn't open (the Talk prompt didn't trigger)")
+        return true, 0, 0, false, false
+    end
+
+    -- 2) press View Bounties, verified
+    task.wait(CONFIG.Robin.DialogWait)
+    if not openBounties() then
+        notify("Couldn't open View Bounties. Open Robin's dialog by hand and press Copy UI Debug.")
+        pressByText({ "bye" }, true)
+        return true, 0, 0, false, false
+    end
+
+    -- 3) accept everything available
+    task.wait(CONFIG.Robin.DialogWait)
+    local accepted = pressAll(CONFIG.Robin.AcceptKeywords, false, CONFIG.Robin.AcceptExclude, nil, 6)
     local fbFish, fbArcade = detect(nil) -- fallback detection while the bounty window is open
-    pressByText({ "bye" }, true)
     pressByText({ "x" }, true)
-    return true, opened, accepted, fbFish, fbArcade
+    pressByText({ "bye" }, true)
+    return true, 1, accepted, fbFish, fbArcade
 end
 
 -- ---------- arcade macro ----------
@@ -686,7 +843,7 @@ content.Position = UDim2.fromOffset(0, 34)
 content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
 content.ScrollBarThickness = 4
-content.CanvasSize = UDim2.fromOffset(0, 560)
+content.CanvasSize = UDim2.fromOffset(0, 590)
 content.Parent = main
 curParent = content
 
@@ -786,10 +943,14 @@ makeButton("Mark Robin Spot (optional)", 10, 372, 280, nil, function()
     if r then robinSpot = r.Position saveData() updateUI() notify("Robin spot marked") end
 end)
 
+makeButton("Copy UI Debug (visible buttons/text)", 10, 404, 280, nil, function()
+    task.spawn(dumpUI)
+end)
+
 makeLabel("Run order: Robin accepts -> arcade macro -> claim -> fishing spot.\n"
     .. "Keep the quest panel closed; the script opens/closes it to claim and to read active quests. "
     .. "The arcade macro must be re-recorded after you re-execute the script.",
-    10, 408, 280, 110, true)
+    10, 440, 280, 110, true)
 
 updateUI = function()
     local counts = { remote = 0, prompt = 0, gui = 0 }
