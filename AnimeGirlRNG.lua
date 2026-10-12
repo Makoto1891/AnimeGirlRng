@@ -683,7 +683,32 @@ local function waitForDialog(timeout)
     return false
 end
 
--- different ways of triggering the Talk prompt (1 = executor fire, 2 = real hold input, 3 = key press)
+-- Robin's dialog text (NPCOMS.MainDialog.DialogFrame.Dialog): wait until it has finished typing,
+-- clicking the choices while it still types / is blank does nothing
+local function dialogLabel()
+    local ok, l = pcall(function() return pg.NPCOMS.MainDialog.DialogFrame.Dialog end)
+    if ok and l and l:IsA("TextLabel") then return l end
+    return nil
+end
+
+local function settleDialog()
+    local l = dialogLabel()
+    if not l then task.wait(1.2) return end
+    local t0, since, last = os.clock(), os.clock(), nil
+    while os.clock() - t0 < 8 do
+        local cur = l.Text .. "|" .. tostring(l.MaxVisibleGraphemes)
+        if cur ~= last then last = cur since = os.clock() end
+        local total = utf8.len(l.Text) or #l.Text
+        if l.Text ~= "" and os.clock() - since >= 1.0 and (l.MaxVisibleGraphemes < 0 or l.MaxVisibleGraphemes >= total) then
+            return
+        end
+        task.wait(0.2)
+    end
+end
+
+-- ways of triggering the Talk prompt:
+-- 1 = real hold input (what custom prompt UIs do, reaches the server), 2 = executor fire,
+-- 3 = the prompt's own on-screen button, 4 = key press
 local function triggerPrompt(r, mode)
     local inst = r.inst
     if not inst:IsA("ProximityPrompt") then fireObj(inst) return end
@@ -693,11 +718,20 @@ local function triggerPrompt(r, mode)
         inst.RequiresLineOfSight = false
         inst.MaxActivationDistance = math.max(inst.MaxActivationDistance, 20)
     end)
-    if mode == 1 and fireproximityprompt then
-        pcall(fireproximityprompt, inst)
-    elseif mode == 2 or mode == 1 then
+    if mode == 1 then
         pcall(function() inst:InputHoldBegin() task.wait(0.15) inst:InputHoldEnd() end)
+    elseif mode == 2 then
+        if fireproximityprompt then pcall(fireproximityprompt, inst) else fireObj(inst) end
     elseif mode == 3 then
+        local pb = robinPromptButton()
+        if pb then
+            tapMethod(pb, 1)
+            task.wait(0.2)
+            tapMethod(pb, 6)
+        else
+            fireObj(inst)
+        end
+    else
         local key = inst.KeyboardKeyCode
         if VIM and key ~= Enum.KeyCode.Unknown then
             pcall(function()
@@ -705,15 +739,6 @@ local function triggerPrompt(r, mode)
                 task.wait(0.15)
                 VIM:SendKeyEvent(false, key, false, game)
             end)
-        else
-            fireObj(inst)
-        end
-    else
-        local pb = robinPromptButton()
-        if pb then
-            tapMethod(pb, 1)
-            task.wait(0.2)
-            tapMethod(pb, 6)
         else
             fireObj(inst)
         end
@@ -737,13 +762,15 @@ local function robinTalk()
         hidePromptGui(not on)
     end
 
-    -- 1) get Robin's dialog on screen. Fire the prompt ONCE per attempt and give the dialog time
-    --    to finish typing (re-firing / tapping on the prompt restarts it and leaves a blank box).
+    -- 1) get Robin's dialog on screen. One trigger per attempt, then give the dialog time to fill in
+    --    (a blank box means the trigger didn't register properly -> next attempt uses another method)
     local ready = waitForDialog(0.3)
+    local usedMode = 1
     for attempt = 1, 4 do
         if ready then break end
         triggerPrompt(r, attempt)
-        ready = waitForDialog(10)
+        ready = waitForDialog(8)
+        if ready then usedMode = attempt notify("Robin dialog opened (trigger " .. attempt .. ")") end
         if not ready then
             teleportTo(r.pos, Vector3.new(0, 3, 2))
             task.wait(0.5)
@@ -755,19 +782,19 @@ local function robinTalk()
         return true, 0, 0, false, false
     end
 
-    -- 2) press View Bounties. Hide Robin's Talk prompt first: its on-screen button sits right on top of
-    --    "View Bounties" and every tap there re-triggers the dialog (blank box).
+    -- 2) let the text finish typing, then press View Bounties (verified; cycles click methods)
+    settleDialog()
     task.wait(CONFIG.Robin.DialogWait)
-    setPrompt(false)
     local opened = openBounties(MAXM)
     if not opened then
-        -- maybe hiding the prompt closed the dialog: bring it back and use only non-screen methods
-        setPrompt(true)
+        -- dialog may have reset: trigger again, hide Robin's Talk prompt so nothing else catches the taps, retry
         if #findButtons(CONFIG.Robin.OpenKeywords) == 0 and not bountyWindowOpen() then
-            triggerPrompt(r, 1)
-            waitForDialog(10)
+            triggerPrompt(r, usedMode)
+            waitForDialog(8)
+            settleDialog()
         end
-        opened = openBounties(2)
+        setPrompt(false)
+        opened = openBounties(MAXM)
     end
     if not opened then
         setPrompt(true)
