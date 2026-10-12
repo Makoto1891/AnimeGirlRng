@@ -979,6 +979,7 @@ end
 
 -- ---------- auto reconnect ----------
 local reconnecting = false
+local saveResume -- defined further down (needs the file storage helpers)
 
 local function queueReload()
     local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
@@ -1003,6 +1004,7 @@ end
 local function rejoin()
     if reconnecting then return end
     reconnecting = true
+    if saveResume then pcall(saveResume) end -- remember how much of the auto run countdown was left
     task.spawn(function()
         notify("Disconnected - rejoining in 5s...")
         task.wait(5)
@@ -1084,6 +1086,18 @@ local function saveIndex(t) sWrite("index", HttpService:JSONEncode(t)) end
 local function getAutoload() return sRead("autoload") end
 local function setAutoload(name)
     if name then sWrite("autoload", name) else sDelete("autoload") end
+end
+
+-- ---------- auto run countdown: resume after a disconnect ----------
+-- On disconnect the remaining time of the auto run countdown is saved. When the script starts again after the
+-- rejoin, Auto Run is turned back on and the countdown continues from the saved time (not reset to 30 min).
+saveResume = function()
+    if robinAuto then
+        local left = math.max(0, nextRobinRun - os.time())
+        sWrite("resume", HttpService:JSONEncode({ robinAuto = true, remaining = left, savedAt = os.time() }))
+    else
+        sDelete("resume")
+    end
 end
 
 -- ---------- config (de)serialization ----------
@@ -1922,6 +1936,21 @@ do
         local ok, msg = loadConfig(al)
         notify(ok and ("Autoloaded config: " .. al .. (msg and (" (" .. msg .. ")") or "")) or ("Autoload failed: " .. tostring(msg)))
         refreshConfigList()
+    end
+end
+-- continue the auto run countdown that was interrupted by a disconnect (only valid for 15 minutes)
+do
+    local raw = sRead("resume")
+    if raw then
+        sDelete("resume")
+        local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok and type(t) == "table" and t.robinAuto == true
+            and tonumber(t.remaining) and tonumber(t.savedAt) and os.time() - t.savedAt <= 900 then
+            robinAuto = true
+            nextRobinRun = os.time() + math.max(5, math.floor(t.remaining))
+            local left = nextRobinRun - os.time()
+            notify(("Auto Run resumed after reconnect: next run in %02d:%02d"):format(math.floor(left / 60), left % 60))
+        end
     end
 end
 updateUI()
