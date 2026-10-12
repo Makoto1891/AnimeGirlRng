@@ -969,13 +969,29 @@ end
 -- ---------- anti-AFK ----------
 local VU = nil
 pcall(function() VU = game:GetService("VirtualUser") end)
-table.insert(conns, lp.Idled:Connect(function()
-    if antiAfk and VU then
+-- right-click at the very top-left corner of the screen.
+-- VirtualUser ignores the position on some executors (it clicked in the middle), so the click is sent with
+-- VirtualInputManager at exact screen coordinates; VirtualUser is only the fallback.
+local AFK_X, AFK_Y = 1, 1
+local function afkClick()
+    if VIM then
+        local ok = pcall(function()
+            VIM:SendMouseButtonEvent(AFK_X, AFK_Y, 1, true, game, 0)
+            task.wait(0.05)
+            VIM:SendMouseButtonEvent(AFK_X, AFK_Y, 1, false, game, 0)
+        end)
+        if ok then return end
+    end
+    if VU then
         pcall(function()
             VU:CaptureController()
-            VU:ClickButton2(Vector2.new())
+            VU:ClickButton2(Vector2.new(AFK_X, AFK_Y))
         end)
     end
+end
+
+table.insert(conns, lp.Idled:Connect(function()
+    if antiAfk then afkClick() end
 end))
 
 -- ---------- auto reconnect ----------
@@ -1912,12 +1928,9 @@ task.spawn(function()
         task.wait(1)
         local now = os.time()
 
-        if antiAfk and VU and now - lastNudge >= 50 then
+        if antiAfk and now - lastNudge >= 50 then
             lastNudge = now
-            pcall(function()
-                VU:CaptureController()
-                VU:ClickButton2(Vector2.new())
-            end)
+            task.spawn(afkClick)
         end
         if autoReconnect and not reconnecting and disconnected() then rejoin() end
 
