@@ -83,6 +83,13 @@ local macro, macroRecording, lastStepT = {}, false, 0
 local lastDetect = "Quests: not checked yet"
 local conns = {}
 local updateUI
+local abortFlag = false  -- set by the STOP button: makes a running run / macro quit as soon as possible
+
+-- sleep that wakes up early when STOP is pressed
+local function sleep(t)
+    local t0 = os.clock()
+    while os.clock() - t0 < t and not abortFlag and alive do task.wait(0.1) end
+end
 local followUpAt = 0     -- when to re-check the quest page after a run (0 = nothing scheduled)
 
 -- ---------- helpers ----------
@@ -820,15 +827,16 @@ local function playMacro(times)
     if #macro == 0 then return 0 end
     local steps = 0
     for _ = 1, times do
-        if not alive then break end
-        if arcadePos then teleportTo(arcadePos, Vector3.new(0, 3, 0)) task.wait(0.5) end
+        if not alive or abortFlag then break end
+        if arcadePos then teleportTo(arcadePos, Vector3.new(0, 3, 0)) sleep(0.5) end
         for _, s in ipairs(macro) do
-            if not alive then break end
-            task.wait(math.clamp(s.dt, 0.05, 6))
+            if not alive or abortFlag then break end
+            sleep(math.clamp(s.dt, 0.05, 6))
+            if abortFlag then break end
             runStep(s)
             steps = steps + 1
         end
-        task.wait(CONFIG.Arcade.BetweenRuns)
+        sleep(CONFIG.Arcade.BetweenRuns)
     end
     return steps
 end
@@ -837,21 +845,26 @@ end
 local function robinRun()
     if busy then notify("Busy - try again in a moment") return end
     busy = true
+    abortFlag = false
     local root = getRoot()
     local origin = root and root.CFrame
     local stayAtFishing = false
     local ok, err = pcall(function()
         local _, accepted = robinTalk()
+        if abortFlag then return end
 
         -- read the quest page, claim whatever is finished
         local _, _, fish, arcade = claimSweep()
+        if abortFlag then return end
 
         local steps = 0
         if arcade then
             if #macro > 0 then
                 steps = playMacro(arcadeRuns)
+                if abortFlag then return end
                 task.wait(1)
                 local ok2, _, f2 = claimSweep()
+                if abortFlag then return end
                 if ok2 then fish = f2 end
             else
                 notify("Arcade quest active but no macro recorded")
@@ -874,7 +887,8 @@ local function robinRun()
             accepted or 0, steps, stayAtFishing and "at fishing spot" or "back home", CONFIG.FollowUpClaimDelay / 60))
     end)
     if not ok then notify("Run error: " .. tostring(err)) end
-    if (not stayAtFishing) and CONFIG.ReturnAfterRun and origin and getRoot() then getRoot().CFrame = origin end
+    if abortFlag then notify("Run stopped") end
+    if (not stayAtFishing) and (not abortFlag) and CONFIG.ReturnAfterRun and origin and getRoot() then getRoot().CFrame = origin end
     busy = false
 end
 
@@ -1452,6 +1466,15 @@ end
 
 local statusLbl = makeLabel("Ready", 10, row(52), 280, 48, true)
 
+makeButton("STOP (auto run + macro)", 10, row(32), 280, RED, function()
+    abortFlag = true
+    robinAuto, claimAuto = false, false
+    followUpAt = 0
+    macroRecording = false
+    notify("Stopped: auto run/claim OFF, running macro/run cancelled")
+    updateUI()
+end)
+
 makeButton("Run Robin Now", 10, row(32), 280, BLUE, function()
     if robinAuto then nextRobinRun = os.time() + CONFIG.Robin.IntervalSeconds end
     task.spawn(robinRun)
@@ -1539,6 +1562,7 @@ makeButton("Test Arcade Macro (1x)", 10, row(32), 280, BLUE, function()
     if #macro == 0 then notify("Record a macro first") return end
     task.spawn(function()
         busy = true
+        abortFlag = false
         pcall(playMacro, 1)
         busy = false
     end)
