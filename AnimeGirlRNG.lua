@@ -146,6 +146,26 @@ local function isShown(obj)
     return true
 end
 
+-- stricter than isShown: ignores hidden/transparent/zero-size/off-screen leftovers
+local function reallyShown(o)
+    if not isShown(o) then return false end
+    local sz = o.AbsoluteSize
+    if sz.X < 2 or sz.Y < 2 then return false end
+    local cam = workspace.CurrentCamera
+    if cam then
+        local vp = cam.ViewportSize
+        local c = o.AbsolutePosition + sz / 2
+        if c.X < 0 or c.Y < -60 or c.X > vp.X or c.Y > vp.Y + 60 then return false end
+    end
+    local cur = o
+    while cur and cur ~= pg do
+        if (cur:IsA("TextLabel") or cur:IsA("TextButton")) and cur.TextTransparency >= 0.95 then return false end
+        if cur:IsA("CanvasGroup") and cur.GroupTransparency >= 0.95 then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
 local function describe(o)
     local p1 = o.Parent
     local p2 = p1 and p1.Parent
@@ -365,7 +385,7 @@ local function findButtons(keywords, exact, exclude, scopeSet)
                         if string.find(t, x, 1, true) then hit = false break end
                     end
                 end
-                if hit and isShown(d) then
+                if hit and reallyShown(d) then
                     local btn = resolveClickable(d)
                     if btn and not seen[btn] and isShown(btn) then
                         seen[btn] = true
@@ -468,7 +488,7 @@ end
 
 local function bountyWindowOpen()
     for _, d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and isShown(d) then
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and reallyShown(d) then
             local t = cleanText(d.Text)
             if #t < 60 then
                 for _, k in ipairs(CONFIG.Robin.WindowKeywords) do
@@ -481,15 +501,17 @@ local function bountyWindowOpen()
 end
 
 -- click "View Bounties", verify the bounty window really opened, cycle click methods until it does
-local function openBounties()
+-- maxM limits which methods may be used (1-2 never touch the screen)
+local function openBounties(maxM)
+    maxM = maxM or MAXM
     for _ = 1, 2 do
-        for i = 0, MAXM - 1 do
+        for i = 0, maxM - 1 do
             if bountyWindowOpen() then return true end
             local targets = findButtons(CONFIG.Robin.OpenKeywords)
             if #targets == 0 then return bountyWindowOpen() end
-            local m = ((prefMethod - 1 + i) % MAXM) + 1
+            local m = ((prefMethod - 1 + i) % maxM) + 1
             tapMethod(targets[1], m)
-            task.wait(1.1)
+            task.wait(1.2)
             if bountyWindowOpen() then
                 prefMethod = m
                 notify(("View Bounties opened (method %d)"):format(m))
@@ -505,7 +527,7 @@ local function dumpUI()
     for _, d in ipairs(pg:GetDescendants()) do
         if isShown(d) then
             if (d:IsA("TextButton") or d:IsA("TextLabel")) and d.Text ~= "" then
-                lines[#lines + 1] = ("%s | %q | %s"):format(d.ClassName, d.Text, d:GetFullName())
+                lines[#lines + 1] = ("%s | %q | %s | size %dx%d | txtT %.2f"):format(d.ClassName, d.Text, d:GetFullName(), d.AbsoluteSize.X, d.AbsoluteSize.Y, d.TextTransparency)
             elseif d:IsA("ImageButton") then
                 lines[#lines + 1] = ("ImageButton | %s | %s"):format(d.Name, d:GetFullName())
             end
@@ -624,6 +646,43 @@ local function findRobin()
     return best
 end
 
+local function waitForDialog(timeout)
+    local t0 = os.clock()
+    while os.clock() - t0 < timeout do
+        if bountyWindowOpen() or #findButtons(CONFIG.Robin.OpenKeywords) > 0 then return true end
+        task.wait(0.25)
+    end
+    return false
+end
+
+-- different ways of triggering the Talk prompt (1 = executor fire, 2 = real hold input, 3 = key press)
+local function triggerPrompt(r, mode)
+    local inst = r.inst
+    if not inst:IsA("ProximityPrompt") then fireObj(inst) return end
+    pcall(function()
+        inst.Enabled = true
+        inst.HoldDuration = 0
+        inst.RequiresLineOfSight = false
+        inst.MaxActivationDistance = math.max(inst.MaxActivationDistance, 20)
+    end)
+    if mode == 1 and fireproximityprompt then
+        pcall(fireproximityprompt, inst)
+    elseif mode == 2 or mode == 1 then
+        pcall(function() inst:InputHoldBegin() task.wait(0.15) inst:InputHoldEnd() end)
+    else
+        local key = inst.KeyboardKeyCode
+        if VIM and key ~= Enum.KeyCode.Unknown then
+            pcall(function()
+                VIM:SendKeyEvent(true, key, false, game)
+                task.wait(0.15)
+                VIM:SendKeyEvent(false, key, false, game)
+            end)
+        else
+            fireObj(inst)
+        end
+    end
+end
+
 local function robinTalk()
     local r = findRobin()
     if not r and robinSpot then
@@ -635,27 +694,45 @@ local function robinTalk()
     teleportTo(r.pos)
     task.wait(0.6)
 
-    -- 1) get Robin's dialog on screen
-    local dialogShown = false
-    for _ = 1, 3 do
-        if bountyWindowOpen() or #findButtons(CONFIG.Robin.OpenKeywords) > 0 then dialogShown = true break end
-        fireObj(r.inst)
-        for _ = 1, 12 do
-            task.wait(0.4)
-            if #findButtons(CONFIG.Robin.OpenKeywords) > 0 or bountyWindowOpen() then dialogShown = true break end
-        end
-        if dialogShown then break end
-        teleportTo(r.pos, Vector3.new(0, 3, 2))
-        task.wait(0.5)
+    local prompt = r.inst
+    local function setPrompt(on)
+        if prompt:IsA("ProximityPrompt") then pcall(function() prompt.Enabled = on end) end
     end
-    if not dialogShown then
-        notify("Robin's dialog didn't open (the Talk prompt didn't trigger)")
+
+    -- 1) get Robin's dialog on screen. Fire the prompt ONCE per attempt and give the dialog time
+    --    to finish typing (re-firing / tapping on the prompt restarts it and leaves a blank box).
+    local ready = waitForDialog(0.3)
+    for attempt = 1, 3 do
+        if ready then break end
+        triggerPrompt(r, attempt)
+        ready = waitForDialog(10)
+        if not ready then
+            teleportTo(r.pos, Vector3.new(0, 3, 2))
+            task.wait(0.5)
+        end
+    end
+    if not ready then
+        setPrompt(true)
+        notify("Robin's dialog never showed its buttons (Talk prompt didn't work)")
         return true, 0, 0, false, false
     end
 
-    -- 2) press View Bounties (verified, cycles click methods)
+    -- 2) press View Bounties. Hide Robin's Talk prompt first: its on-screen button sits right on top of
+    --    "View Bounties" and every tap there re-triggers the dialog (blank box).
     task.wait(CONFIG.Robin.DialogWait)
-    if not openBounties() then
+    setPrompt(false)
+    local opened = openBounties(MAXM)
+    if not opened then
+        -- maybe hiding the prompt closed the dialog: bring it back and use only non-screen methods
+        setPrompt(true)
+        if #findButtons(CONFIG.Robin.OpenKeywords) == 0 and not bountyWindowOpen() then
+            triggerPrompt(r, 1)
+            waitForDialog(10)
+        end
+        opened = openBounties(2)
+    end
+    if not opened then
+        setPrompt(true)
         notify("Couldn't open View Bounties. Open Robin's dialog by hand and press Copy UI Debug.")
         pressByText({ "bye" }, true)
         return true, 0, 0, false, false
@@ -668,6 +745,7 @@ local function robinTalk()
     pressByText({ "x" }, true)
     task.wait(0.3)
     pressByText({ "bye" }, true)
+    setPrompt(true)
     return true, 1, accepted, fbFish, fbArcade
 end
 
