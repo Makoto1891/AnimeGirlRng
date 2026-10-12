@@ -558,7 +558,7 @@ local function getQuestIcon()
         if o then questIcon = o return o end
     end
     for _, d in ipairs(pg:GetDescendants()) do
-        if d:IsA("GuiButton") and matches(d.Name, CONFIG.QuestIconNames) and isShown(d) then
+        if d:IsA("GuiButton") and (matches(d.Name, CONFIG.QuestIconNames) or (d.Parent and matches(d.Parent.Name, CONFIG.QuestIconNames))) and isShown(d) then
             questIcon = d
             return d
         end
@@ -646,6 +646,34 @@ local function findRobin()
     return best
 end
 
+local hiddenPromptBtns = {}
+local function hidePromptGui(on)
+    pcall(function()
+        local g = pg:FindFirstChild("ExpressivePromptsGui")
+        if not g then return end
+        if on then
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiButton") and d.Visible and string.find(lower(d:GetFullName()), "robin", 1, true) then
+                    hiddenPromptBtns[#hiddenPromptBtns + 1] = d
+                    d.Visible = false
+                end
+            end
+        else
+            for _, d in ipairs(hiddenPromptBtns) do pcall(function() d.Visible = true end) end
+            table.clear(hiddenPromptBtns)
+        end
+    end)
+end
+
+local function robinPromptButton()
+    local g = pg:FindFirstChild("ExpressivePromptsGui")
+    if not g then return nil end
+    for _, d in ipairs(g:GetDescendants()) do
+        if d:IsA("GuiButton") and string.find(lower(d:GetFullName()), "robin", 1, true) then return d end
+    end
+    return nil
+end
+
 local function waitForDialog(timeout)
     local t0 = os.clock()
     while os.clock() - t0 < timeout do
@@ -669,7 +697,7 @@ local function triggerPrompt(r, mode)
         pcall(fireproximityprompt, inst)
     elseif mode == 2 or mode == 1 then
         pcall(function() inst:InputHoldBegin() task.wait(0.15) inst:InputHoldEnd() end)
-    else
+    elseif mode == 3 then
         local key = inst.KeyboardKeyCode
         if VIM and key ~= Enum.KeyCode.Unknown then
             pcall(function()
@@ -677,6 +705,15 @@ local function triggerPrompt(r, mode)
                 task.wait(0.15)
                 VIM:SendKeyEvent(false, key, false, game)
             end)
+        else
+            fireObj(inst)
+        end
+    else
+        local pb = robinPromptButton()
+        if pb then
+            tapMethod(pb, 1)
+            task.wait(0.2)
+            tapMethod(pb, 6)
         else
             fireObj(inst)
         end
@@ -697,12 +734,13 @@ local function robinTalk()
     local prompt = r.inst
     local function setPrompt(on)
         if prompt:IsA("ProximityPrompt") then pcall(function() prompt.Enabled = on end) end
+        hidePromptGui(not on)
     end
 
     -- 1) get Robin's dialog on screen. Fire the prompt ONCE per attempt and give the dialog time
     --    to finish typing (re-firing / tapping on the prompt restarts it and leaves a blank box).
     local ready = waitForDialog(0.3)
-    for attempt = 1, 3 do
+    for attempt = 1, 4 do
         if ready then break end
         triggerPrompt(r, attempt)
         ready = waitForDialog(10)
