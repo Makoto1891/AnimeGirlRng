@@ -55,7 +55,8 @@ local CONFIG = {
         DefaultRuns = 1,
         MaxSteps = 400,
     },
-    TeleportOffset =Vector3.new(0, 3, 4),
+    AntiAfkJumpSeconds = 600,          -- Anti-AFK: jump every this many seconds (saved in configs too)
+    TeleportOffset = Vector3.new(0, 3, 4),
     ReturnAfterRun = true,
     VirtualClickFallback = true,
     SaveFile = "AGRNG_Robin.json",
@@ -73,6 +74,7 @@ local alive = true
 local busy = false
 local robinAuto, claimAuto = CONFIG.Robin.AutoStart, false
 local antiAfk, autoReconnect = true, false
+local afkInterval = CONFIG.AntiAfkJumpSeconds
 local nextRobinRun, nextClaim = os.time() + CONFIG.Robin.FirstRunDelay, 0
 local fishSpot, robinSpot, arcadePos = nil, nil, nil
 local arcadeRuns = CONFIG.Arcade.DefaultRuns
@@ -966,33 +968,15 @@ local function robinRun()
     busy = false
 end
 
--- ---------- anti-AFK ----------
-local VU = nil
-pcall(function() VU = game:GetService("VirtualUser") end)
--- right-click at the very top-left corner of the screen.
--- VirtualUser ignores the position on some executors (it clicked in the middle), so the click is sent with
--- VirtualInputManager at exact screen coordinates; VirtualUser is only the fallback.
-local AFK_X, AFK_Y = 1, 1
-local function afkClick()
-    if VIM then
-        local ok = pcall(function()
-            VIM:SendMouseButtonEvent(AFK_X, AFK_Y, 1, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(AFK_X, AFK_Y, 1, false, game, 0)
-        end)
-        if ok then return end
-    end
-    if VU then
-        pcall(function()
-            VU:CaptureController()
-            VU:ClickButton2(Vector2.new(AFK_X, AFK_Y))
-        end)
+-- ---------- anti-AFK (jump) ----------
+-- makes your character jump every `afkInterval` seconds (set CONFIG.AntiAfkJumpSeconds at the top, saved in configs)
+local function afkJump()
+    local c = lp.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health > 0 then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
     end
 end
-
-table.insert(conns, lp.Idled:Connect(function()
-    if antiAfk then afkClick() end
-end))
 
 -- ---------- auto reconnect ----------
 local reconnecting = false
@@ -1328,7 +1312,7 @@ local function buildConfig()
         v = 2,
         settings = {
             runs = arcadeRuns, robinAuto = robinAuto, claimAuto = claimAuto,
-            antiAfk = antiAfk, autoReconnect = autoReconnect,
+            antiAfk = antiAfk, jumpEvery = afkInterval, autoReconnect = autoReconnect,
             fish = v3t(fishSpot), robin = v3t(robinSpot), arcade = v3t(arcadePos), icon = questIconInfo,
         },
         macro = m,
@@ -1347,6 +1331,7 @@ local function applyConfig(t)
     if robinAuto then nextRobinRun = os.time() + CONFIG.Robin.FirstRunDelay end
     if claimAuto then nextClaim = os.time() + 10 end
     antiAfk = st.antiAfk ~= false
+    afkInterval = math.clamp(tonumber(st.jumpEvery) or CONFIG.AntiAfkJumpSeconds, 5, 3600)
     autoReconnect = st.autoReconnect == true
     if autoReconnect then queueReload() end
     local bad, pending = decodeMacro(t.macro)
@@ -1876,7 +1861,7 @@ updateUI = function()
     pickBtn.BackgroundColor3 = pickMode and RED or Color3.fromRGB(60, 60, 80)
     setToggle(autoBtn, ("Auto Run every %d min"):format(CONFIG.Robin.IntervalSeconds / 60), robinAuto)
     setToggle(claimBtn, ("Auto Claim Quests (every %d min)"):format(CONFIG.ClaimInterval / 60), claimAuto)
-    setToggle(afkBtn, "Anti-AFK", antiAfk)
+    setToggle(afkBtn, ("Anti-AFK Jump (every %ds)"):format(afkInterval), antiAfk)
     setToggle(reconBtn, "Auto Reconnect (+reload script)", autoReconnect)
     setToggle(spyBtn, "Remote Spy", spyOn)
     local al = getAutoload()
@@ -1928,9 +1913,9 @@ task.spawn(function()
         task.wait(1)
         local now = os.time()
 
-        if antiAfk and now - lastNudge >= 50 then
+        if antiAfk and now - lastNudge >= afkInterval then
             lastNudge = now
-            task.spawn(afkClick)
+            afkJump()
         end
         if autoReconnect and not reconnecting and disconnected() then rejoin() end
 
