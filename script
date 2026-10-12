@@ -1,0 +1,306 @@
+--[[
+    Anime Girl RNG - Quest Helper (Delta compatible)
+    Features:
+      * Scans the map for NPCs (ProximityPrompt / ClickDetector based)
+      * Teleport to any NPC on Island 1 or Island 2
+      * Auto-accept quests from Island 2 NPCs
+
+    HOW TO USE
+      1. Stand on Island 1 and press "Mark Island 1 here".
+      2. Go to Island 2 and press "Mark Island 2 here".
+      3. Press "Rescan NPCs" - NPCs are sorted by the nearest island mark.
+      4. Toggle "Auto Accept Quests (Island 2)" or click an NPC to teleport.
+]]
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local lp = Players.LocalPlayer
+
+-- ================= CONFIG =================
+local CONFIG = {
+    QuestKeywords = { "quest", "accept", "talk", "mission", "task" }, -- prompt text to match
+    IslandRadius  = 600,   -- studs from a mark to count as that island
+    LoopDelay     = 2,     -- seconds between auto-accept cycles
+    TeleportOffset = Vector3.new(0, 3, 4),
+    ReturnAfterAccept = false, -- teleport back to where you were after each accept
+}
+-- ==========================================
+
+-- Cleanup old copy
+local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
+pcall(function()
+    local old = guiParent:FindFirstChild("AGRNG_Helper")
+    if old then old:Destroy() end
+end)
+
+local state = {
+    marks = {},        -- [1] = Vector3, [2] = Vector3
+    npcs = {},         -- { {name=, pos=, prompt=, click=, island=} }
+    autoQuest = false,
+}
+
+-- ---------- helpers ----------
+local function getRoot()
+    local c = lp.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function notify(text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "AG RNG Helper", Text = text, Duration = 3,
+        })
+    end)
+end
+
+local function teleportTo(pos)
+    local root = getRoot()
+    if root then
+        root.CFrame = CFrame.new(pos + CONFIG.TeleportOffset)
+        return true
+    end
+    return false
+end
+
+local function islandOf(pos)
+    local best, bestDist
+    for i, mark in pairs(state.marks) do
+        local d = (mark - pos).Magnitude
+        if d <= CONFIG.IslandRadius and (not bestDist or d < bestDist) then
+            best, bestDist = i, d
+        end
+    end
+    return best
+end
+
+local function isPlayerCharacter(inst)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character and inst:IsDescendantOf(p.Character) then return true end
+    end
+    return false
+end
+
+local function matchesQuest(text)
+    text = string.lower(text or "")
+    for _, k in ipairs(CONFIG.QuestKeywords) do
+        if string.find(text, k, 1, true) then return true end
+    end
+    return false
+end
+
+-- ---------- NPC scanning ----------
+local function scanNPCs()
+    table.clear(state.npcs)
+    for _, d in ipairs(workspace:GetDescendants()) do
+        local isPrompt = d:IsA("ProximityPrompt")
+        local isClick = d:IsA("ClickDetector")
+        if (isPrompt or isClick) and not isPlayerCharacter(d) then
+            local holder = d.Parent
+            local model = holder and (holder:FindFirstAncestorOfClass("Model") or holder)
+            if model then
+                local pos
+                if model:IsA("Model") then
+                    local ok, pivot = pcall(function() return model:GetPivot().Position end)
+                    pos = ok and pivot
+                elseif model:IsA("BasePart") then
+                    pos = model.Position
+                end
+                if pos then
+                    local label = (isPrompt and (d.ObjectText ~= "" and d.ObjectText or nil)) or nil
+                    table.insert(state.npcs, {
+                        name = model.Name .. (label and (" [" .. label .. "]") or ""),
+                        pos = pos,
+                        prompt = isPrompt and d or nil,
+                        click = isClick and d or nil,
+                        actionText = isPrompt and d.ActionText or "",
+                        island = islandOf(pos),
+                    })
+                end
+            end
+        end
+    end
+    table.sort(state.npcs, function(a, b)
+        if (a.island or 9) ~= (b.island or 9) then return (a.island or 9) < (b.island or 9) end
+        return a.name < b.name
+    end)
+end
+
+-- ---------- quest accepting ----------
+local function interact(npc)
+    if npc.prompt and npc.prompt.Parent then
+        pcall(function() npc.prompt.HoldDuration = 0 end)
+        if fireproximityprompt then
+            fireproximityprompt(npc.prompt)
+        else
+            npc.prompt:InputHoldBegin(); task.wait(0.1); npc.prompt:InputHoldEnd()
+        end
+    elseif npc.click and npc.click.Parent and fireclickdetector then
+        fireclickdetector(npc.click)
+    end
+end
+
+local function acceptIsland2Quests()
+    local root = getRoot()
+    if not root then return end
+    local origin = root.CFrame
+    for _, npc in ipairs(state.npcs) do
+        if not state.autoQuest then break end
+        if npc.island == 2 and (matchesQuest(npc.actionText) or matchesQuest(npc.name)) then
+            teleportTo(npc.pos)
+            task.wait(0.4)
+            interact(npc)
+            task.wait(0.4)
+        end
+    end
+    if CONFIG.ReturnAfterAccept and getRoot() then getRoot().CFrame = origin end
+end
+
+task.spawn(function()
+    while task.wait(CONFIG.LoopDelay) do
+        if state.autoQuest then
+            if not state.marks[2] then
+                state.autoQuest = false
+                notify("Mark Island 2 first!")
+            else
+                scanNPCs()
+                pcall(acceptIsland2Quests)
+            end
+        end
+    end
+end)
+
+-- ---------- UI ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "AGRNG_Helper"
+gui.ResetOnSpawn = false
+gui.Parent = guiParent
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(280, 380)
+main.Position = UDim2.new(0, 20, 0.5, -190)
+main.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -30, 0, 30)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Anime Girl RNG Helper"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.fromOffset(24, 24)
+close.Position = UDim2.new(1, -28, 0, 3)
+close.BackgroundColor3 = Color3.fromRGB(170, 60, 60)
+close.Text = "X"
+close.TextColor3 = Color3.new(1, 1, 1)
+close.Font = Enum.Font.GothamBold
+close.TextSize = 12
+close.Parent = main
+Instance.new("UICorner", close)
+close.MouseButton1Click:Connect(function() state.autoQuest = false; gui:Destroy() end)
+
+-- dragging
+do
+    local dragging, dragStart, startPos
+    main.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+local function makeButton(text, y, color, parent, callback)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -20, 0, 28)
+    b.Position = UDim2.fromOffset(10, y)
+    b.BackgroundColor3 = color or Color3.fromRGB(60, 60, 80)
+    b.Text = text
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 13
+    b.Parent = parent or main
+    Instance.new("UICorner", b)
+    b.MouseButton1Click:Connect(function() callback(b) end)
+    return b
+end
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -20, 0, 150)
+list.Position = UDim2.fromOffset(10, 225)
+list.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.CanvasSize = UDim2.new()
+list.Parent = main
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 3)
+
+local function refreshList()
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    for _, npc in ipairs(state.npcs) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -6, 0, 24)
+        b.BackgroundColor3 = Color3.fromRGB(45, 45, 62)
+        b.Text = ("[I%s] %s"):format(npc.island or "?", npc.name)
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 12
+        b.TextTruncate = Enum.TextTruncate.AtEnd
+        b.Parent = list
+        b.MouseButton1Click:Connect(function() teleportTo(npc.pos) end)
+    end
+    list.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 4)
+end
+
+makeButton("Mark Island 1 here", 38, nil, main, function()
+    local r = getRoot()
+    if r then state.marks[1] = r.Position; notify("Island 1 marked") end
+end)
+makeButton("Mark Island 2 here", 70, nil, main, function()
+    local r = getRoot()
+    if r then state.marks[2] = r.Position; notify("Island 2 marked") end
+end)
+makeButton("Rescan NPCs", 102, Color3.fromRGB(50, 90, 140), main, function()
+    scanNPCs(); refreshList()
+    notify(#state.npcs .. " interactables found")
+end)
+makeButton("Auto Accept Quests (Island 2): OFF", 134, Color3.fromRGB(60, 120, 70), main, function(b)
+    if not state.marks[2] then notify("Mark Island 2 first!") return end
+    state.autoQuest = not state.autoQuest
+    b.Text = "Auto Accept Quests (Island 2): " .. (state.autoQuest and "ON" or "OFF")
+    b.BackgroundColor3 = state.autoQuest and Color3.fromRGB(40, 160, 70) or Color3.fromRGB(60, 120, 70)
+end)
+makeButton("Teleport: Island 1 mark", 166, nil, main, function()
+    if state.marks[1] then teleportTo(state.marks[1]) else notify("Island 1 not marked") end
+end)
+makeButton("Teleport: Island 2 mark", 198 - 0, nil, main, function()
+    if state.marks[2] then teleportTo(state.marks[2]) else notify("Island 2 not marked") end
+end)
+
+list.Position = UDim2.fromOffset(10, 232)
+list.Size = UDim2.new(1, -20, 0, 140)
+
+notify("Loaded. Mark both islands, then Rescan NPCs.")
