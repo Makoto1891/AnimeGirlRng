@@ -268,8 +268,7 @@ end
 
 local function pressTarget(o)
     if o:IsA("GuiButton") then return pressButton(o) end
-    vimTap(o, true)
-    return 1
+    return 0 -- no raw mouse taps on non-button objects (these used to click the middle of the screen)
 end
 
 -- ---------- finding buttons ----------
@@ -1389,6 +1388,22 @@ local function deleteConfig(name)
     if currentConfig == name then currentConfig = nil end
 end
 
+-- when a toggle is flipped while a config is loaded, write the new toggle values into that saved config
+-- (only the toggles are touched - the macro and spots in the saved file stay exactly as they were)
+local function autosaveSettings()
+    if not currentConfig then return end
+    local raw = sRead("cfg_" .. currentConfig)
+    if not raw then return end
+    local ok, t = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok or type(t) ~= "table" then return end
+    t.settings = type(t.settings) == "table" and t.settings or {}
+    t.settings.robinAuto = robinAuto
+    t.settings.claimAuto = claimAuto
+    t.settings.antiAfk = antiAfk
+    t.settings.autoReconnect = autoReconnect
+    pcall(function() sWrite("cfg_" .. currentConfig, HttpService:JSONEncode(t)) end)
+end
+
 -- ---------- UI ----------
 local gui = Instance.new("ScreenGui")
 gui.Name = "AGRNG_Helper"
@@ -1562,12 +1577,14 @@ local autoBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
     else
         notify("Auto Run OFF")
     end
+    autosaveSettings()
     updateUI()
 end)
 
 local claimBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
     claimAuto = not claimAuto
     if claimAuto then nextClaim = os.time() end
+    autosaveSettings()
     updateUI()
 end)
 
@@ -1670,6 +1687,7 @@ end)
 
 local afkBtn = makeButton("", 10, row(32), 280, GREEN_ON, function()
     antiAfk = not antiAfk
+    autosaveSettings()
     updateUI()
 end)
 local reconBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
@@ -1678,6 +1696,7 @@ local reconBtn = makeButton("", 10, row(32), 280, OFFCOL, function()
         local q = queueReload()
         notify(q and "Auto Reconnect ON (script reloads after rejoin)" or "Auto Reconnect ON (executor can't auto-reload the script)")
     end
+    autosaveSettings()
     updateUI()
 end)
 
@@ -1889,7 +1908,7 @@ table.insert(conns, UIS.InputBegan:Connect(function(input)
         return
     end
     if macroRecording then
-        local o = topInteractiveAt(pos)
+        local o = topButtonAt(pos) -- only real buttons are recorded as taps
         if o then pushStep({ kind = "gui", obj = o, info = describe(o) }) end
     end
 end))
